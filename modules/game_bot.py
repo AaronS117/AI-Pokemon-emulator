@@ -306,6 +306,8 @@ class GameBot:
         self._fps_frame0: int = 0
         self.real_fps: float = 0.0         # measured fps, readable from outside
         self._sleep_overrun_ms: float = 0.0  # last sleep overrun in ms (debug)
+        self.pil_ms: float = 0.0           # last to_pil() duration in ms (debug)
+        self.pil_ms_max: float = 0.0       # worst-case to_pil() in ms (debug)
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -649,7 +651,11 @@ class GameBot:
         self._frames_since_render += 1
         if self._frames_since_render >= self._render_every:
             try:
+                _t0 = _time_mod.perf_counter()
                 self.instance._last_rendered = self.instance._screen.to_pil().convert("RGB")
+                self.pil_ms = (_time_mod.perf_counter() - _t0) * 1000.0
+                if self.pil_ms > self.pil_ms_max:
+                    self.pil_ms_max = self.pil_ms
             except Exception:
                 pass
             self._frames_since_render = 0

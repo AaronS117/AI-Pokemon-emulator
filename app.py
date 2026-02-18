@@ -617,9 +617,10 @@ def emulator_worker(
             fc  = b.frame_count
             fps = b.real_fps
             ovr = b._sleep_overrun_ms
-            prefix = f"[F:{fc:06d} fps:{fps:5.1f} ovr:{ovr:4.1f}ms] "
+            pil = b.pil_ms
+            prefix = f"[F:{fc:06d} fps:{fps:5.1f} ovr:{ovr:4.1f}ms pil:{pil:4.1f}ms] "
         else:
-            prefix = "[F:------ fps:---.-] "
+            prefix = "[F:------ fps:---.- ovr:--.-ms pil:--.-ms] "
         full = prefix + msg
         getattr(wlog, level)(full, *args)
 

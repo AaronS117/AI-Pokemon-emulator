@@ -386,11 +386,12 @@ def _update_card_inner(app: "App", inst_id: int, state: "InstanceState", w: dict
     if state.status == "error" and state.error:
         w["frames"].configure(text=state.error[:60], text_color=C["red"])
     else:
-        w["frames"].configure(text=f"Frames: {state.frame_count:,}",
-                              text_color=C["text_dim"])
+        w["frames"].configure(
+            text=f"F:{state.frame_count:,}  {state.fps:.1f}fps",
+            text_color=C["text_dim"])
 
     w["enc"].configure(text=f"Enc: {state.encounters:,}")
-    w["fps"].configure(text=f"FPS: {state.fps:,.0f}")
+    w["fps"].configure(text=f"FPS: {state.fps:.1f}")
 
     speed_str = f"{state.speed_multiplier}x" if state.speed_multiplier > 0 else "max"
     info_text = f"#{inst_id}  TID:{state.tid}  SID:{state.sid}  spd:{speed_str}"
