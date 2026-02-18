@@ -688,7 +688,22 @@ class App(ctk.CTk):
         rom_frame = ctk.CTkFrame(parent, fg_color="transparent")
         rom_frame.pack(fill="x", **pad)
 
-        self._rom_var = ctk.StringVar(value=self.settings.get("rom_path", ""))
+        # Auto-detect ROM: prefer saved path, then canonical firered.gba, then any .gba in emulator/
+        _saved_rom = self.settings.get("rom_path", "")
+        if not _saved_rom or not Path(_saved_rom).exists():
+            from modules.config import EMULATOR_DIR
+            _canonical = EMULATOR_DIR / "firered.gba"
+            if _canonical.exists():
+                _saved_rom = str(_canonical)
+            else:
+                _found = sorted(EMULATOR_DIR.glob("*.gba"))
+                if _found:
+                    _saved_rom = str(_found[0])
+            if _saved_rom:
+                self.settings["rom_path"] = _saved_rom
+                save_settings(self.settings)
+
+        self._rom_var = ctk.StringVar(value=_saved_rom)
         rom_entry = ctk.CTkEntry(
             rom_frame, textvariable=self._rom_var,
             placeholder_text="Select ROM file...",
@@ -732,20 +747,47 @@ class App(ctk.CTk):
             text_color=C["text"],
         ).pack(anchor="w", padx=16, pady=(12, 4))
 
-        self._mode_var = ctk.StringVar(value=self.settings.get("bot_mode", "encounter_farm"))
+        self._mode_var = ctk.StringVar(value=self.settings.get("bot_mode", ""))
+        self._mode_buttons: dict = {}
+
+        def _make_mode_toggle(key):
+            def _toggle():
+                if self._mode_var.get() == key:
+                    # Clicking the already-selected mode deselects it
+                    self._mode_var.set("")
+                else:
+                    self._mode_var.set(key)
+                _refresh_mode_buttons()
+            return _toggle
+
+        def _refresh_mode_buttons():
+            selected = self._mode_var.get()
+            for k, btn in self._mode_buttons.items():
+                if k == selected:
+                    btn.configure(fg_color=C["accent"], text_color="#fff",
+                                  border_color=C["accent"])
+                else:
+                    btn.configure(fg_color=C["bg_dark"], text_color=C["text"],
+                                  border_color=C["border"])
+
         for key, info in BOT_MODES.items():
-            color = C["text"] if info["status"] == "Ready" else C["text_dim"]
-            state = "normal" if info["status"] == "Ready" else "disabled"
-            rb = ctk.CTkRadioButton(
-                parent, text=f"{info['label']}",
-                variable=self._mode_var, value=key,
-                font=ctk.CTkFont(size=12), text_color=color,
-                fg_color=C["accent"], hover_color=C["accent_h"],
-                border_color=C["border"],
+            is_ready = info["status"] == "Ready"
+            btn = ctk.CTkButton(
+                parent,
+                text=info["label"],
+                font=ctk.CTkFont(size=12),
+                fg_color=C["accent"] if self._mode_var.get() == key else C["bg_dark"],
+                text_color="#fff" if self._mode_var.get() == key else C["text"],
+                hover_color=C["accent_h"],
+                border_width=1,
+                border_color=C["accent"] if self._mode_var.get() == key else C["border"],
+                height=28,
+                anchor="w",
+                command=_make_mode_toggle(key) if is_ready else None,
+                state="normal" if is_ready else "disabled",
             )
-            rb.pack(anchor="w", padx=20, pady=2)
-            if info["status"] != "Ready":
-                rb.configure(state="disabled")
+            btn.pack(fill="x", padx=20, pady=2)
+            self._mode_buttons[key] = btn
 
         # ── Area ─────────────────────────────────────────────────────────
         ctk.CTkLabel(
@@ -1260,8 +1302,14 @@ class App(ctk.CTk):
         win.configure(fg_color=C["bg_dark"])
         win.resizable(False, False)
 
-        # Prevent closing the window from killing the thread — just hide it
-        win.protocol("WM_DELETE_WINDOW", lambda: win.iconify())
+        # Closing the window stops this instance and destroys the window
+        def _on_close():
+            state.request_stop()
+            try:
+                win.after(200, win.destroy)
+            except Exception:
+                pass
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
         # ── Title bar row ────────────────────────────────────────────────
         title_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
@@ -1454,19 +1502,17 @@ class App(ctk.CTk):
         if not path:
             return
         src = Path(path)
-        # Auto-copy ROM into emulator/ so all instances share one canonical path
         from modules.config import EMULATOR_DIR
         EMULATOR_DIR.mkdir(parents=True, exist_ok=True)
-        dest = EMULATOR_DIR / src.name
+        # Always copy to canonical name: emulator/firered.gba
+        dest = EMULATOR_DIR / "firered.gba"
         if src.resolve() != dest.resolve():
             try:
                 shutil.copy2(src, dest)
-                self._rom_status.configure(
-                    text=f"Copied → emulator/{src.name}", text_color=C["green"])
             except Exception as exc:
                 self._rom_status.configure(
                     text=f"Copy failed: {exc}", text_color=C["red"])
-                dest = src  # fall back to original path
+                dest = src
         self._rom_var.set(str(dest))
         self.settings["rom_path"] = str(dest)
         save_settings(self.settings)
