@@ -323,21 +323,28 @@ class InstanceState:
     shiny_pokemon: str = ""
     error: str = ""
     cpu_core: int = -1
+    manual_control: bool = False  # True = user has taken over, bot pauses
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _pause_event: threading.Event = field(default_factory=threading.Event)
+    _input_queue: "queue.Queue" = field(default_factory=lambda: __import__('queue').Queue())
 
     def request_stop(self):
         self._stop_event.set()
+        self._pause_event.set()  # unblock any pause-wait immediately
 
     def request_pause(self):
-        if self._pause_event.is_set():
+        if self._pause_event.is_set() and not self._stop_event.is_set():
             self._pause_event.clear()
         else:
             self._pause_event.set()
 
+    def send_input(self, button_name: str):
+        """Queue a manual button press from the GUI thread."""
+        self._input_queue.put(button_name)
+
     @property
     def is_paused(self) -> bool:
-        return self._pause_event.is_set()
+        return self._pause_event.is_set() and not self._stop_event.is_set()
 
     @property
     def should_stop(self) -> bool:
@@ -386,14 +393,29 @@ def emulator_worker(
             rom_path=Path(rom_path),
         )
 
-        # Boot the game
-        for _ in range(300):
+        # ── Boot sequence: skip title screen and reach overworld ────────
+        from modules.game_bot import GameState as GState, GBAButton
+        state.status = "booting"
+        MAX_BOOT_FRAMES = 3600  # 60 seconds at 60fps
+        boot_frames = 0
+        while boot_frames < MAX_BOOT_FRAMES:
             if state.should_stop:
                 bot.destroy()
                 state.status = "stopped"
                 return
-            bot.advance_frames(1)
+            game_state = bot.get_game_state()
+            if game_state == GState.TITLE_SCREEN:
+                # Press A/Start to advance past title
+                bot.press_button(GBAButton.A)
+                bot.advance_frames(10)
+            elif game_state in (GState.OVERWORLD, GState.BATTLE,
+                                GState.CHOOSE_STARTER, GState.MAIN_MENU):
+                break  # reached playable state
+            else:
+                bot.advance_frames(5)
+            boot_frames += 5
             state.frame_count = bot.frame_count
+        state.status = "running"
 
         # Navigate to area for encounter-based modes
         if state.bot_mode in ("encounter_farm", "sweet_scent", "rock_smash",
@@ -416,10 +438,39 @@ def emulator_worker(
 
         # Main loop: call mode.step() repeatedly
         while not state.should_stop:
-            # Handle pause
-            while state.is_paused and not state.should_stop:
-                state.status = "paused"
-                time.sleep(0.1)
+            # Handle pause / manual control
+            while (state.is_paused or state.manual_control) and not state.should_stop:
+                if state.manual_control:
+                    state.status = "manual"
+                    # Drain queued manual inputs and send to emulator
+                    import queue as _queue
+                    while True:
+                        try:
+                            btn_name = state._input_queue.get_nowait()
+                            _btn_map = {
+                                "a": GBAButton.A, "b": GBAButton.B,
+                                "start": GBAButton.START, "select": GBAButton.SELECT,
+                                "up": GBAButton.UP, "down": GBAButton.DOWN,
+                                "left": GBAButton.LEFT, "right": GBAButton.RIGHT,
+                                "l": GBAButton.L, "r": GBAButton.R,
+                            }
+                            gbtn = _btn_map.get(btn_name.lower())
+                            if gbtn is not None:
+                                bot.press_button(gbtn, hold_frames=4)
+                                state.frame_count = bot.frame_count
+                                # Capture screenshot after input
+                                try:
+                                    sc = bot.get_screenshot()
+                                    if sc:
+                                        state.last_screenshot = sc
+                                except Exception:
+                                    pass
+                        except _queue.Empty:
+                            break
+                    time.sleep(0.016)  # ~60fps polling
+                else:
+                    state.status = "paused"
+                    time.sleep(0.05)
             if state.should_stop:
                 break
             state.status = "running"
@@ -647,6 +698,15 @@ class App(ctk.CTk):
 
         hw_frame = ctk.CTkFrame(title_bar, fg_color="transparent")
         hw_frame.pack(side="right", padx=20)
+
+        ctk.CTkButton(
+            hw_frame, text="⚙ Settings", width=90, height=30,
+            font=ctk.CTkFont(size=12),
+            fg_color=C["bg_dark"], hover_color=C["accent"],
+            border_width=1, border_color=C["border"],
+            command=self._open_settings,
+        ).pack(side="left", padx=(0, 12))
+
         ctk.CTkLabel(
             hw_frame, text=cpu_text,
             font=ctk.CTkFont(size=11), text_color=C["text_dim"],
@@ -1316,7 +1376,7 @@ class App(ctk.CTk):
         title_row.pack(fill="x")
 
         status_label = ctk.CTkLabel(
-            title_row, text="STARTING", width=80,
+            title_row, text="BOOTING", width=80,
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=C["yellow"],
         )
@@ -1333,7 +1393,7 @@ class App(ctk.CTk):
         btn_box.pack(side="right", padx=6)
 
         pause_btn = ctk.CTkButton(
-            btn_box, text="Pause", width=55, height=24,
+            btn_box, text="Pause", width=50, height=24,
             font=ctk.CTkFont(size=10),
             fg_color=C["yellow"], hover_color="#ca8a04", text_color="#000",
             command=lambda: state.request_pause(),
@@ -1341,12 +1401,34 @@ class App(ctk.CTk):
         pause_btn.pack(side="left", padx=2)
 
         stop_btn = ctk.CTkButton(
-            btn_box, text="Stop", width=55, height=24,
+            btn_box, text="Stop", width=50, height=24,
             font=ctk.CTkFont(size=10),
             fg_color=C["red"], hover_color="#dc2626", text_color="#fff",
             command=lambda: state.request_stop(),
         )
-        stop_btn.pack(side="left", padx=(2, 0))
+        stop_btn.pack(side="left", padx=2)
+
+        # Take Control toggle button
+        ctrl_btn_ref = [None]
+
+        def _toggle_control():
+            state.manual_control = not state.manual_control
+            if state.manual_control:
+                ctrl_btn_ref[0].configure(
+                    text="Bot", fg_color=C["accent"], text_color="#fff")
+                win.focus_set()
+            else:
+                ctrl_btn_ref[0].configure(
+                    text="Control", fg_color="#1e3a5f", text_color=C["text"])
+
+        ctrl_btn = ctk.CTkButton(
+            btn_box, text="Control", width=58, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color="#1e3a5f", hover_color=C["accent"], text_color=C["text"],
+            command=_toggle_control,
+        )
+        ctrl_btn.pack(side="left", padx=(2, 0))
+        ctrl_btn_ref[0] = ctrl_btn
 
         # ── Live game screen (240×160 scaled 1.25x → 300×200) ───────────
         screen_label = ctk.CTkLabel(win, text="", fg_color=C["bg_dark"])
@@ -1355,12 +1437,31 @@ class App(ctk.CTk):
         # Placeholder while waiting for first frame
         placeholder = ctk.CTkLabel(
             win,
-            text="Waiting for first frame…\n\nROM required:\nemulator/firered.gba",
+            text="Booting game…\n\nPress A/Start to advance\nor wait for auto-boot",
             font=ctk.CTkFont(size=11), text_color=C["text_dim"],
             fg_color="#111111", width=300, height=200,
         )
         placeholder.pack()
         placeholder_ref = [placeholder]  # mutable ref so update can hide it
+
+        # ── Keyboard bindings (active when window is focused) ────────────
+        _keybinds = self.settings.get("keybinds", {
+            "a": "a", "s": "b", "Return": "start", "BackSpace": "select",
+            "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+            "q": "l", "w": "r",
+        })
+
+        def _on_key(event):
+            if not state.manual_control:
+                return
+            key = event.keysym
+            btn = _keybinds.get(key)
+            if btn:
+                state.send_input(btn)
+
+        win.bind("<KeyPress>", _on_key)
+        # Click on screen to focus window for keyboard input
+        screen_label.bind("<Button-1>", lambda e: win.focus_set())
 
         # ── Metrics row ──────────────────────────────────────────────────
         metrics_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
@@ -1416,12 +1517,15 @@ class App(ctk.CTk):
 
         # Status label + window title color
         status_map = {
-            "running":    ("RUNNING", C["green"]),
-            "paused":     ("PAUSED",  C["yellow"]),
-            "shiny_found":("SHINY!",  C["gold"]),
-            "stopped":    ("STOPPED", C["red"]),
-            "error":      ("ERROR",   C["red"]),
-            "idle":       ("IDLE",    C["text_dim"]),
+            "running":    ("RUNNING",  C["green"]),
+            "booting":    ("BOOTING",  C["yellow"]),
+            "paused":     ("PAUSED",   C["yellow"]),
+            "manual":     ("MANUAL",   C["accent"]),
+            "shiny_found":("SHINY!",   C["gold"]),
+            "stopped":    ("STOPPED",  C["red"]),
+            "error":      ("ERROR",    C["red"]),
+            "idle":       ("IDLE",     C["text_dim"]),
+            "completed":  ("DONE",     C["green"]),
         }
         text, color = status_map.get(state.status, ("...", C["text_dim"]))
         w["status"].configure(text=text, text_color=color)
@@ -1489,6 +1593,281 @@ class App(ctk.CTk):
                 win.configure(fg_color=C["gold"])
             except Exception:
                 pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  SETTINGS WINDOW
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        """Open mGBA-style settings window with tabs."""
+        win = ctk.CTkToplevel(self)
+        win.title("Settings")
+        win.geometry("560x520")
+        win.configure(fg_color=C["bg_dark"])
+        win.resizable(False, False)
+        win.grab_set()  # modal
+
+        # ── Tab bar ──────────────────────────────────────────────────────
+        tab_names = ["ROM / Paths", "Keybinds", "Audio", "Display"]
+        tab_frames: Dict[str, ctk.CTkFrame] = {}
+        tab_btns: Dict[str, ctk.CTkButton] = {}
+
+        tab_bar = ctk.CTkFrame(win, fg_color=C["bg_card"], corner_radius=0, height=40)
+        tab_bar.pack(fill="x")
+        tab_bar.pack_propagate(False)
+
+        content_area = ctk.CTkFrame(win, fg_color=C["bg_dark"])
+        content_area.pack(fill="both", expand=True, padx=0, pady=0)
+
+        for name in tab_names:
+            f = ctk.CTkScrollableFrame(content_area, fg_color=C["bg_dark"])
+            tab_frames[name] = f
+
+        def _switch_tab(name):
+            for n, f in tab_frames.items():
+                f.pack_forget()
+            tab_frames[name].pack(fill="both", expand=True, padx=16, pady=12)
+            for n, b in tab_btns.items():
+                b.configure(
+                    fg_color=C["accent"] if n == name else "transparent",
+                    text_color="#fff" if n == name else C["text_dim"],
+                )
+
+        for name in tab_names:
+            b = ctk.CTkButton(
+                tab_bar, text=name, width=120, height=38,
+                font=ctk.CTkFont(size=12),
+                fg_color="transparent", hover_color=C["bg_input"],
+                text_color=C["text_dim"], corner_radius=0,
+                command=lambda n=name: _switch_tab(n),
+            )
+            b.pack(side="left")
+            tab_btns[name] = b
+
+        # ── ROM / Paths tab ──────────────────────────────────────────────
+        rf = tab_frames["ROM / Paths"]
+
+        def _lbl(parent, text, bold=False):
+            ctk.CTkLabel(parent, text=text,
+                         font=ctk.CTkFont(size=12, weight="bold" if bold else "normal"),
+                         text_color=C["text"] if bold else C["text_dim"],
+                         anchor="w").pack(fill="x", pady=(8, 2))
+
+        _lbl(rf, "GBA ROM File", bold=True)
+        rom_row = ctk.CTkFrame(rf, fg_color="transparent")
+        rom_row.pack(fill="x")
+        rom_entry_var = ctk.StringVar(value=self.settings.get("rom_path", ""))
+        rom_entry = ctk.CTkEntry(rom_row, textvariable=rom_entry_var,
+                                 fg_color=C["bg_input"], border_color=C["border"])
+        rom_entry.pack(side="left", fill="x", expand=True)
+
+        def _browse_rom_settings():
+            path = ctk.filedialog.askopenfilename(
+                title="Select GBA ROM",
+                filetypes=[("GBA ROMs", "*.gba *.bin"), ("All files", "*.*")])
+            if not path:
+                return
+            src = Path(path)
+            from modules.config import EMULATOR_DIR
+            EMULATOR_DIR.mkdir(parents=True, exist_ok=True)
+            dest = EMULATOR_DIR / "firered.gba"
+            if src.resolve() != dest.resolve():
+                try:
+                    shutil.copy2(src, dest)
+                except Exception:
+                    dest = src
+            rom_entry_var.set(str(dest))
+
+        ctk.CTkButton(rom_row, text="Browse", width=70,
+                      fg_color=C["accent"], hover_color=C["accent_h"],
+                      command=_browse_rom_settings).pack(side="right", padx=(6, 0))
+
+        def _clear_rom():
+            rom_entry_var.set("")
+        ctk.CTkButton(rf, text="Clear ROM selection", width=160, height=26,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=C["bg_input"], hover_color=C["red"],
+                      border_width=1, border_color=C["border"],
+                      command=_clear_rom).pack(anchor="w", pady=(4, 0))
+
+        _lbl(rf, "Save Directory", bold=True)
+        from modules.config import EMULATOR_DIR as _EMUDIR
+        ctk.CTkLabel(rf, text=str(_EMUDIR / "saves"),
+                     font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+                     anchor="w").pack(fill="x")
+
+        # ── Keybinds tab ─────────────────────────────────────────────────
+        kf = tab_frames["Keybinds"]
+        _keybinds = self.settings.get("keybinds", {
+            "a": "a", "s": "b", "Return": "start", "BackSpace": "select",
+            "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+            "q": "l", "w": "r",
+        })
+
+        ctk.CTkLabel(kf, text="GBA Button → Keyboard Key",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["text"]).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(kf, text="Click a field and press any key to rebind.",
+                     font=ctk.CTkFont(size=11), text_color=C["text_dim"]).pack(anchor="w", pady=(0, 12))
+
+        gba_buttons = [
+            ("A", "a"), ("B", "s"), ("Start", "Return"), ("Select", "BackSpace"),
+            ("Up", "Up"), ("Down", "Down"), ("Left", "Left"), ("Right", "Right"),
+            ("L", "q"), ("R", "w"),
+        ]
+        # Reverse map: gba_name -> current keyboard key
+        _rev = {v: k for k, v in _keybinds.items()}
+        bind_vars: Dict[str, ctk.StringVar] = {}
+
+        grid = ctk.CTkFrame(kf, fg_color="transparent")
+        grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
+
+        for row_i, (gba_name, default_key) in enumerate(gba_buttons):
+            gba_lower = gba_name.lower()
+            cur_key = _rev.get(gba_lower, default_key)
+            var = ctk.StringVar(value=cur_key)
+            bind_vars[gba_lower] = var
+
+            ctk.CTkLabel(grid, text=f"GBA {gba_name}",
+                         font=ctk.CTkFont(size=12), text_color=C["text"],
+                         width=100, anchor="w").grid(
+                row=row_i, column=0, padx=(0, 12), pady=3, sticky="w")
+
+            entry = ctk.CTkEntry(grid, textvariable=var, width=120,
+                                 fg_color=C["bg_input"], border_color=C["border"])
+            entry.grid(row=row_i, column=1, pady=3, sticky="w")
+
+            def _make_capture(e, v):
+                def _cap(event):
+                    v.set(event.keysym)
+                    e.configure(border_color=C["accent"])
+                    e.after(500, lambda: e.configure(border_color=C["border"]))
+                    return "break"
+                e.bind("<KeyPress>", _cap)
+            _make_capture(entry, var)
+
+        # ── Audio tab ────────────────────────────────────────────────────
+        af = tab_frames["Audio"]
+        ctk.CTkLabel(af, text="Audio Settings",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["text"]).pack(anchor="w", pady=(0, 12))
+
+        _audio = self.settings.get("audio", {})
+
+        mute_var = ctk.BooleanVar(value=_audio.get("mute", True))
+        ctk.CTkCheckBox(af, text="Mute emulator audio",
+                        variable=mute_var,
+                        font=ctk.CTkFont(size=12), text_color=C["text"],
+                        fg_color=C["accent"], hover_color=C["accent_h"],
+                        border_color=C["border"]).pack(anchor="w", pady=4)
+
+        ctk.CTkLabel(af, text="Master Volume",
+                     font=ctk.CTkFont(size=12), text_color=C["text_dim"]).pack(anchor="w", pady=(12, 2))
+        vol_var = ctk.IntVar(value=_audio.get("volume", 50))
+        vol_slider = ctk.CTkSlider(af, from_=0, to=100, variable=vol_var,
+                                   button_color=C["accent"], button_hover_color=C["accent_h"],
+                                   progress_color=C["accent"])
+        vol_slider.pack(fill="x", pady=(0, 4))
+        vol_lbl = ctk.CTkLabel(af, text=f"{vol_var.get()}%",
+                               font=ctk.CTkFont(size=11), text_color=C["text_dim"])
+        vol_lbl.pack(anchor="w")
+        vol_slider.configure(command=lambda v: vol_lbl.configure(text=f"{int(v)}%"))
+
+        ctk.CTkLabel(af, text="Notification Sound Volume",
+                     font=ctk.CTkFont(size=12), text_color=C["text_dim"]).pack(anchor="w", pady=(12, 2))
+        notif_vol_var = ctk.IntVar(value=_audio.get("notif_volume", 80))
+        notif_slider = ctk.CTkSlider(af, from_=0, to=100, variable=notif_vol_var,
+                                     button_color=C["accent"], button_hover_color=C["accent_h"],
+                                     progress_color=C["accent"])
+        notif_slider.pack(fill="x", pady=(0, 4))
+        notif_lbl = ctk.CTkLabel(af, text=f"{notif_vol_var.get()}%",
+                                 font=ctk.CTkFont(size=11), text_color=C["text_dim"])
+        notif_lbl.pack(anchor="w")
+        notif_slider.configure(command=lambda v: notif_lbl.configure(text=f"{int(v)}%"))
+
+        # ── Display tab ──────────────────────────────────────────────────
+        df = tab_frames["Display"]
+        ctk.CTkLabel(df, text="Display Settings",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["text"]).pack(anchor="w", pady=(0, 12))
+
+        _display = self.settings.get("display", {})
+
+        ctk.CTkLabel(df, text="Instance Window Scale",
+                     font=ctk.CTkFont(size=12), text_color=C["text_dim"]).pack(anchor="w", pady=(0, 2))
+        scale_var = ctk.StringVar(value=_display.get("scale", "1.25x"))
+        ctk.CTkOptionMenu(df, variable=scale_var,
+                          values=["1x (240×160)", "1.25x (300×200)", "1.5x (360×240)", "2x (480×320)"],
+                          fg_color=C["bg_input"], button_color=C["accent"],
+                          button_hover_color=C["accent_h"],
+                          dropdown_fg_color=C["bg_card"]).pack(anchor="w", pady=(0, 12))
+
+        video_var = ctk.BooleanVar(value=self.settings.get("video_enabled", True))
+        ctk.CTkCheckBox(df, text="Show live game screen in instance windows",
+                        variable=video_var,
+                        font=ctk.CTkFont(size=12), text_color=C["text"],
+                        fg_color=C["accent"], hover_color=C["accent_h"],
+                        border_color=C["border"]).pack(anchor="w", pady=4)
+
+        fps_cap_var = ctk.BooleanVar(value=_display.get("fps_cap", False))
+        ctk.CTkCheckBox(df, text="Cap screen refresh to 30 FPS (saves CPU)",
+                        variable=fps_cap_var,
+                        font=ctk.CTkFont(size=12), text_color=C["text"],
+                        fg_color=C["accent"], hover_color=C["accent_h"],
+                        border_color=C["border"]).pack(anchor="w", pady=4)
+
+        dark_var = ctk.BooleanVar(value=_display.get("dark_mode", True))
+        ctk.CTkCheckBox(df, text="Dark mode",
+                        variable=dark_var,
+                        font=ctk.CTkFont(size=12), text_color=C["text"],
+                        fg_color=C["accent"], hover_color=C["accent_h"],
+                        border_color=C["border"]).pack(anchor="w", pady=4)
+
+        # ── Save / Cancel buttons ─────────────────────────────────────────
+        btn_row = ctk.CTkFrame(win, fg_color=C["bg_card"], corner_radius=0, height=50)
+        btn_row.pack(fill="x", side="bottom")
+        btn_row.pack_propagate(False)
+
+        def _save_settings():
+            # Rebuild keybinds: keyboard_key -> gba_name
+            new_keybinds = {}
+            for gba_name, var in bind_vars.items():
+                new_keybinds[var.get()] = gba_name
+
+            self.settings["rom_path"] = rom_entry_var.get()
+            self.settings["keybinds"] = new_keybinds
+            self.settings["audio"] = {
+                "mute": mute_var.get(),
+                "volume": vol_var.get(),
+                "notif_volume": notif_vol_var.get(),
+            }
+            self.settings["display"] = {
+                "scale": scale_var.get(),
+                "fps_cap": fps_cap_var.get(),
+                "dark_mode": dark_var.get(),
+            }
+            self.settings["video_enabled"] = video_var.get()
+            save_settings(self.settings)
+
+            # Apply ROM path to sidebar entry
+            self._rom_var.set(rom_entry_var.get())
+            self._validate_rom_display()
+
+            win.destroy()
+
+        ctk.CTkButton(btn_row, text="Save", width=100, height=34,
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      fg_color=C["accent"], hover_color=C["accent_h"],
+                      command=_save_settings).pack(side="right", padx=12, pady=8)
+        ctk.CTkButton(btn_row, text="Cancel", width=80, height=34,
+                      font=ctk.CTkFont(size=12),
+                      fg_color=C["bg_dark"], hover_color=C["bg_input"],
+                      border_width=1, border_color=C["border"],
+                      command=win.destroy).pack(side="right", padx=(0, 4), pady=8)
+
+        # Start on ROM tab
+        _switch_tab("ROM / Paths")
 
     # ─────────────────────────────────────────────────────────────────────
     #  ACTIONS
