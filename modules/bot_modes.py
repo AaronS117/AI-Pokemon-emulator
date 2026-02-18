@@ -175,11 +175,14 @@ class StarterResetMode(BotMode):
             return ModeResult(status=self.status)
 
         if self._phase == "reset":
+            fc = self.bot.frame_count
+            logger.info("[StarterReset] Soft reset #%d at frame %d",
+                        self.encounters + 1, fc)
             self.bot.soft_reset()
             self._phase = "skip_intro"
             self._wait_frames = 0
             return ModeResult(status=ModeStatus.RUNNING,
-                              message="Soft resetting...")
+                              message=f"Soft resetting... (reset #{self.encounters+1}, frame {fc})")
 
         elif self._phase == "skip_intro":
             # Mash A to get through intro screens
@@ -191,6 +194,8 @@ class StarterResetMode(BotMode):
             if self._wait_frames > 60:
                 state = self.bot.get_game_state()
                 if state == GameState.OVERWORLD:
+                    logger.info("[StarterReset] Overworld reached at frame %d",
+                                self.bot.frame_count)
                     self._phase = "select_starter"
                     self._wait_frames = 0
 
@@ -215,7 +220,8 @@ class StarterResetMode(BotMode):
                 pass
 
             if self._wait_frames > 200:
-                # Timeout – restart
+                logger.warning("[StarterReset] Starter select timed out at frame %d – resetting",
+                               self.bot.frame_count)
                 self._phase = "reset"
 
             return ModeResult(status=ModeStatus.RUNNING,
@@ -245,6 +251,8 @@ class StarterResetMode(BotMode):
                 logger.error("Failed to read starter data: %s", exc)
 
             # Not shiny – reset
+            logger.info("[StarterReset] Reset #%d not shiny (frame %d)",
+                        self.encounters, self.bot.frame_count)
             self._phase = "reset"
             return ModeResult(
                 is_shiny=False,

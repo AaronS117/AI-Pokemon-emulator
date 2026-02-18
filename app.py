@@ -732,8 +732,8 @@ def emulator_worker(
         fps_timer = _fps_state[0]
         fps_frame_start = _fps_state[1]
 
-        # Video already enabled right after launch; keep it on in main loop
-        bot.set_video_enabled(True)
+        # Render every frame by default (manual/watch mode); bot modes reduce this
+        bot._render_every = 1
 
         _btn_map = {
             "a": GBAButton.A, "b": GBAButton.B,
@@ -753,14 +753,13 @@ def emulator_worker(
                 _active_mode_key = state.bot_mode
                 mode = _create_mode(_active_mode_key, bot)
                 mode.start()
-                # Disable full video for bot modes (periodic render is enough)
-                bot.set_video_enabled(False)
+                bot._render_every = 4   # bot mode: preview ~15fps
                 wlog.info("Instance %d  Switched to mode: %s", iid, _active_mode_key)
 
             # ── Manual / paused idle loop ────────────────────────────────────
             while (state.is_paused or state.manual_control) and not state.should_stop:
                 if state.manual_control:
-                    bot.set_video_enabled(True)
+                    bot._render_every = 1  # manual: capture every frame for live preview
                     state.status = "manual"
                     while True:
                         try:
@@ -789,12 +788,12 @@ def emulator_worker(
                 _active_mode_key = state.bot_mode
                 mode = _create_mode(_active_mode_key, bot)
                 mode.start()
-                bot.set_video_enabled(False)
+                bot._render_every = 4   # bot mode: preview ~15fps
                 wlog.info("Instance %d  Resumed with mode: %s", iid, _active_mode_key)
 
             # ── Watch mode: game runs at 1x, full video, no bot inputs ───────
             if _active_mode_key == "manual":
-                bot.set_video_enabled(True)
+                bot._render_every = 1  # watch mode: every frame
                 bot.advance_frames(1)
                 state.frame_count = bot.frame_count
                 sc = bot.get_screenshot()
@@ -2006,7 +2005,7 @@ class App(ctk.CTk):
         for iid, state in list(self.instances.items()):
             self._update_card(iid, state)
             total_enc += state.encounters
-            if state.status in ("running", "manual"):
+            if state.status in ("running", "manual", "booting"):
                 total_fps += state.fps
                 active += 1
             # Update scroll-frame row

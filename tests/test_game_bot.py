@@ -58,19 +58,23 @@ class TestSetSpeed:
         assert bot._frame_budget == 0.0
 
     def test_1x_speed_sets_correct_budget(self):
+        # GBA native: 16,777,216 Hz / 280,896 cycles/frame = 59.7275... fps
+        _GBA_FPS = 16_777_216 / 280_896
         bot = _make_bot()
         bot.set_speed(1)
-        assert abs(bot._frame_budget - (1.0 / 60.0)) < 1e-9
+        assert abs(bot._frame_budget - (1.0 / _GBA_FPS)) < 1e-9
 
     def test_2x_speed_sets_correct_budget(self):
+        _GBA_FPS = 16_777_216 / 280_896
         bot = _make_bot()
         bot.set_speed(2)
-        assert abs(bot._frame_budget - (1.0 / 120.0)) < 1e-9
+        assert abs(bot._frame_budget - (1.0 / (_GBA_FPS * 2))) < 1e-9
 
     def test_4x_speed_sets_correct_budget(self):
+        _GBA_FPS = 16_777_216 / 280_896
         bot = _make_bot()
         bot.set_speed(4)
-        assert abs(bot._frame_budget - (1.0 / 240.0)) < 1e-9
+        assert abs(bot._frame_budget - (1.0 / (_GBA_FPS * 4))) < 1e-9
 
     def test_throttle_sleeps_when_budget_set(self):
         """When speed=1x, _apply_inputs_and_run_frame should sleep."""

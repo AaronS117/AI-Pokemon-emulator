@@ -273,8 +273,8 @@ class GameBot:
         self._speed: int = 0
         self._frame_budget: float = 0.0  # seconds per frame; 0 = unthrottled
         self._last_frame_time: float = 0.0
-        self._video_enabled: bool = False  # rendering layers on/off
-        self._render_every: int = 30       # render 1 frame every N frames for preview
+        self._video_enabled: bool = True   # always capture frames for preview
+        self._render_every: int = 4        # capture 1 frame every N frames (15fps preview)
         self._frames_since_render: int = 0
 
     # ── Lifecycle ────────────────────────────────────────────────────────
@@ -334,9 +334,10 @@ class GameBot:
         # Reset the core to start emulation
         core.reset()
 
-        # Start with rendering disabled for speed; enable per-frame as needed
-        self._video_enabled = False
-        self._set_renderer(core._native, False)
+        # mGBA always renders to the video buffer on run_frame() – we just
+        # control how often we READ the buffer for the UI preview.
+        self._video_enabled = True
+        self._frames_since_render = 0
 
         inst._core = core
         inst._native = core._native
@@ -373,22 +374,13 @@ class GameBot:
                     inst, f"{speed}x" if speed > 0 else "max", inst.save_path)
         return inst
 
-    @staticmethod
-    def _set_renderer(native, enabled: bool) -> None:
-        """Enable or disable all GBA rendering layers on a native core."""
-        disable = not enabled
-        for i in range(4):
-            native.video.renderer.disableBG[i] = disable
-        native.video.renderer.disableOBJ    = disable
-        native.video.renderer.disableWIN[0] = disable
-        native.video.renderer.disableWIN[1] = disable
-        native.video.renderer.disableOBJWIN = disable
-
     def set_video_enabled(self, enabled: bool) -> None:
-        """Permanently enable/disable video rendering (e.g. for manual/watch mode)."""
+        """Control how often the video buffer is read for the UI preview.
+        enabled=True  → capture every _render_every frames (live preview)
+        enabled=False → same rate; mGBA always renders internally regardless.
+        This no longer disables BG layers (which caused a black screen).
+        """
         self._video_enabled = enabled
-        if self.instance and self.instance._native:
-            self._set_renderer(self.instance._native, enabled)
 
     def set_speed(self, speed: int) -> None:
         """
@@ -403,8 +395,11 @@ class GameBot:
         import time as _time
         self._speed = speed
         # _frame_budget: seconds per frame budget (0 = no sleep)
+        # GBA native frame rate: 16,777,216 Hz / 280,896 cycles per frame
+        # = 59.7275560...  fps  (NOT 60.0)
+        _GBA_FPS = 16_777_216 / 280_896  # ≈ 59.7275
         if speed > 0:
-            self._frame_budget = 1.0 / (60.0 * speed)
+            self._frame_budget = 1.0 / (_GBA_FPS * speed)
         else:
             self._frame_budget = 0.0
         # Initialise the timer NOW so the very first frame doesn't see
@@ -610,34 +605,20 @@ class GameBot:
 
     def _apply_inputs_and_run_frame(self) -> None:
         """Set current inputs on the core and advance one frame.
+        mGBA always renders to the video buffer on every run_frame() call –
+        we just throttle how often we READ it for the UI preview.
         Applies sleep-based throttle when _frame_budget > 0 (speed=1x etc.).
-        Periodically enables rendering for one frame to keep the preview live.
         """
         import time as _time
-        core   = self.instance._core
-        native = self.instance._native
+        core = self.instance._core
 
-        # Decide whether to render this frame
-        self._frames_since_render += 1
-        render_this_frame = self._video_enabled or (
-            self._frames_since_render >= self._render_every
-        )
-        if render_this_frame and not self._video_enabled:
-            self._set_renderer(native, True)
-
+        # Run one GBA frame (mGBA always renders internally)
         core._core.setKeys(core._core, self._pressed_inputs | self._held_inputs)
         core.run_frame()
 
-        if render_this_frame and not self._video_enabled:
-            # Capture the rendered frame into _last_rendered
-            try:
-                self.instance._last_rendered = self.instance._screen.to_pil().convert("RGB")
-            except Exception:
-                pass
-            self._set_renderer(native, False)
-            self._frames_since_render = 0
-        elif self._video_enabled:
-            # Always update when rendering is permanently on
+        # Read the video buffer periodically for the UI preview
+        self._frames_since_render += 1
+        if self._frames_since_render >= self._render_every:
             try:
                 self.instance._last_rendered = self.instance._screen.to_pil().convert("RGB")
             except Exception:
@@ -646,7 +627,8 @@ class GameBot:
 
         self._prev_pressed_inputs = self._pressed_inputs
         self._pressed_inputs = 0
-        # Sleep-based throttle (only when 1x or Nx speed is requested)
+
+        # Sleep-based throttle to hit the target frame rate
         if self._frame_budget > 0:
             now = _time.perf_counter()
             elapsed = now - self._last_frame_time
