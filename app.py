@@ -659,20 +659,26 @@ def emulator_worker(
             else:
                 wlog.info("Instance %d  Already in playable state (%s) – skipping title advance", iid, _initial_gs.name)
 
-        state.status = "running"
         wlog.info("Instance %d  Boot complete – entering main loop (mode=%s)", iid, state.bot_mode)
 
-        # Navigate to area for encounter-based modes
-        if state.bot_mode in ("encounter_farm", "sweet_scent", "rock_smash",
-                              "safari_zone", "fishing"):
+        # If started in manual mode, idle but do NOT auto-set manual_control.
+        # The user must explicitly click the Manual button in the instance window.
+        if state.bot_mode == "manual":
+            state.status = "manual"
+            wlog.info("Instance %d  Manual mode – click the Manual button in the instance window to take control", iid)
+
+        # Navigate to area only for encounter-based bot modes
+        if not state.manual_control and state.bot_mode in (
+                "encounter_farm", "sweet_scent", "rock_smash", "safari_zone", "fishing"):
             wlog.info("Instance %d  Navigating to area: %s", iid, area)
             try:
                 bot.navigate_to_area(area)
             except Exception as exc:
                 wlog.warning("Instance %d  Navigation failed (continuing): %s", iid, exc)
 
-        # Instantiate the correct BotMode
-        mode = _create_mode(state.bot_mode, bot)
+        # Instantiate the current BotMode (may be _ManualMode initially)
+        _active_mode_key = state.bot_mode
+        mode = _create_mode(_active_mode_key, bot)
         mode.start()
 
         # Async worker for non-blocking DB writes
@@ -682,43 +688,61 @@ def emulator_worker(
         fps_timer = time.time()
         fps_frame_start = bot.frame_count
 
-        # Main loop: call mode.step() repeatedly
+        _btn_map = {
+            "a": GBAButton.A, "b": GBAButton.B,
+            "start": GBAButton.START, "select": GBAButton.SELECT,
+            "up": GBAButton.UP, "down": GBAButton.DOWN,
+            "left": GBAButton.LEFT, "right": GBAButton.RIGHT,
+            "l": GBAButton.L, "r": GBAButton.R,
+        }
+
+        # Main loop
         while not state.should_stop:
-            # Handle pause / manual control
+            # ── If the user switched bot mode via the UI, reinitialise ──────
+            if state.bot_mode != _active_mode_key and not state.manual_control:
+                mode.stop()
+                _active_mode_key = state.bot_mode
+                mode = _create_mode(_active_mode_key, bot)
+                mode.start()
+                wlog.info("Instance %d  Switched to mode: %s", iid, _active_mode_key)
+
+            # ── Manual / paused idle loop ────────────────────────────────────
             while (state.is_paused or state.manual_control) and not state.should_stop:
                 if state.manual_control:
                     state.status = "manual"
-                    _btn_map = {
-                        "a": GBAButton.A, "b": GBAButton.B,
-                        "start": GBAButton.START, "select": GBAButton.SELECT,
-                        "up": GBAButton.UP, "down": GBAButton.DOWN,
-                        "left": GBAButton.LEFT, "right": GBAButton.RIGHT,
-                        "l": GBAButton.L, "r": GBAButton.R,
-                    }
-                    # Drain any queued button presses
                     import queue as _queue
-                    _pressed_any = False
                     while True:
                         try:
                             btn_name = state._input_queue.get_nowait()
                             gbtn = _btn_map.get(btn_name.lower())
                             if gbtn is not None:
                                 bot.press_button(gbtn, hold_frames=4)
-                                _pressed_any = True
                         except _queue.Empty:
                             break
-                    # Always advance at least 1 frame so the game keeps running
-                    # and the screen stays live (fixes blank screen in manual mode)
                     bot.advance_frames(1)
                     state.frame_count = bot.frame_count
-                    # Capture screenshot every frame in manual mode
                     _worker_capture_screen(bot, state)
-                    time.sleep(0.016)  # ~60fps polling
+                    time.sleep(0.016)
                 else:
                     state.status = "paused"
                     time.sleep(0.05)
+
             if state.should_stop:
                 break
+
+            # ── Returning from manual: re-init mode if needed ────────────────
+            if state.bot_mode != _active_mode_key:
+                mode.stop()
+                _active_mode_key = state.bot_mode
+                mode = _create_mode(_active_mode_key, bot)
+                mode.start()
+                wlog.info("Instance %d  Resumed with mode: %s", iid, _active_mode_key)
+
+            # ── Skip step() for pure manual mode ────────────────────────────
+            if _active_mode_key == "manual":
+                time.sleep(0.016)
+                continue
+
             state.status = "running"
 
             # Execute one mode step
@@ -824,8 +848,19 @@ def emulator_worker(
         logger.exception("Worker error in instance %d", state.instance_id)
 
 
+class _ManualMode(BotMode):
+    """No-op bot mode – user drives the emulator manually."""
+    name = "Manual Control"
+    description = "User controls the emulator directly."
+
+    def step(self) -> ModeResult:
+        return ModeResult(status=ModeStatus.RUNNING)
+
+
 def _create_mode(mode_key: str, bot) -> BotMode:
     """Instantiate the correct BotMode subclass from a mode key string."""
+    if mode_key == "manual":
+        return _ManualMode(bot)
     mode_cls = ALL_MODES.get(mode_key)
     if mode_cls is None:
         logger.warning("Unknown mode '%s', falling back to encounter_farm", mode_key)

@@ -176,16 +176,19 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
                                  border_color=C["accent"])
             bot_btn.configure(fg_color=C["bg_dark"], text_color=C["text_dim"],
                               border_color=C["border"])
+            _show_input_overlay(False)
             win.focus_set()
         else:
             # Switch to whichever mode is selected in the dropdown
             chosen = _label_to_key(_mode_var.get())
             state.bot_mode = chosen
+            state.manual_control = False
             state.status = "running"
             bot_btn.configure(fg_color=C["accent"], text_color="#fff",
                               border_color=C["accent"])
             manual_btn.configure(fg_color=C["bg_dark"], text_color=C["text_dim"],
                                  border_color=C["border"])
+            _show_input_overlay(True)
 
     _init_manual = state.manual_control or state.bot_mode == "manual"
 
@@ -250,6 +253,28 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
     placeholder.pack(fill="both", expand=True)
     placeholder_ref = [placeholder]
 
+    # ── Input-locked overlay (shown until user clicks Manual) ─────────────
+    _input_locked = [not _init_manual]  # True = keyboard blocked
+
+    input_overlay = ctk.CTkLabel(
+        screen_frame,
+        text="🔒  Click  🕹 Manual  to take control\n\nKeyboard input is disabled",
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=C["text_dim"],
+        fg_color="#0a0a0a",
+        corner_radius=0,
+    )
+    if _input_locked[0]:
+        input_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _show_input_overlay(show: bool):
+        _input_locked[0] = show
+        if show:
+            input_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            input_overlay.lift()
+        else:
+            input_overlay.place_forget()
+
     # ── Keyboard bindings ─────────────────────────────────────────────────
     _keybinds = app.settings.get("keybinds", {
         "a": "a", "s": "b", "Return": "start", "BackSpace": "select",
@@ -265,7 +290,9 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
             state.send_input(btn)
 
     win.bind("<KeyPress>", _on_key)
-    screen_label.bind("<Button-1>", lambda e: win.focus_set())
+    # Clicking the overlay activates manual mode
+    input_overlay.bind("<Button-1>", lambda e: _set_manual(True))
+    screen_label.bind("<Button-1>", lambda e: win.focus_set() if state.manual_control else None)
 
     # ── Metrics bar ───────────────────────────────────────────────────────
     metrics_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
