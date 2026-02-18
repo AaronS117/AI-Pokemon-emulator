@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import struct
 import subprocess
 import sys
@@ -438,6 +439,15 @@ def emulator_worker(
                 state.fps = (bot.frame_count - fps_frame_start) / (now - fps_timer)
                 fps_timer = now
                 fps_frame_start = bot.frame_count
+
+            # Live screen capture for GUI preview (every 30 frames ~= 0.5s at 60fps)
+            if state.frame_count % 30 == 0:
+                try:
+                    screenshot = bot.get_screenshot()
+                    if screenshot is not None:
+                        state.last_screenshot = screenshot
+                except Exception:
+                    pass
 
             # AI vision processing (Layer 1 – runs every Nth frame)
             if _ai_bridge and state.frame_count % 5 == 0:
@@ -1237,91 +1247,114 @@ class App(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────
 
     def _create_card(self, inst_id: int, state: InstanceState):
-        card = ctk.CTkFrame(
-            self._scroll_frame, fg_color=C["bg_input"],
-            corner_radius=10, border_width=1, border_color=C["border"],
-        )
-        card.pack(fill="x", pady=4)
+        """Open a dedicated Toplevel window for this emulator instance."""
+        # Tile windows: 4 per row, each 320px wide
+        col = inst_id % 4
+        row = inst_id // 4
+        x_off = 20 + col * 340
+        y_off = 60 + row * 340
 
-        # Row 1: status + info + buttons
-        row1 = ctk.CTkFrame(card, fg_color="transparent")
-        row1.pack(fill="x", padx=12, pady=(10, 4))
+        win = ctk.CTkToplevel(self)
+        win.title(f"Instance #{inst_id}  –  {BOT_MODES.get(state.bot_mode, {}).get('label', state.bot_mode)}")
+        win.geometry(f"320x330+{x_off}+{y_off}")
+        win.configure(fg_color=C["bg_dark"])
+        win.resizable(False, False)
+
+        # Prevent closing the window from killing the thread — just hide it
+        win.protocol("WM_DELETE_WINDOW", lambda: win.iconify())
+
+        # ── Title bar row ────────────────────────────────────────────────
+        title_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
+        title_row.pack(fill="x")
 
         status_label = ctk.CTkLabel(
-            row1, text="STARTING", width=90,
+            title_row, text="STARTING", width=80,
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=C["yellow"],
         )
-        status_label.pack(side="left")
+        status_label.pack(side="left", padx=(8, 0), pady=6)
 
-        info_text = f"#{inst_id}  |  Seed: 0x{state.seed:04X}  |  TID: {state.tid}  SID: {state.sid}"
-        if state.cpu_core >= 0:
-            info_text += f"  |  Core {state.cpu_core}"
+        info_text = f"#{inst_id}  TID:{state.tid}  SID:{state.sid}"
         info_label = ctk.CTkLabel(
-            row1, text=info_text,
-            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+            title_row, text=info_text,
+            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
         )
-        info_label.pack(side="left", padx=12)
+        info_label.pack(side="left", padx=6)
 
-        mode_label = ctk.CTkLabel(
-            row1, text=BOT_MODES.get(state.bot_mode, {}).get("label", ""),
-            font=ctk.CTkFont(size=10), text_color=C["accent"],
-        )
-        mode_label.pack(side="left", padx=(0, 12))
-
-        btn_box = ctk.CTkFrame(row1, fg_color="transparent")
-        btn_box.pack(side="right")
+        btn_box = ctk.CTkFrame(title_row, fg_color="transparent")
+        btn_box.pack(side="right", padx=6)
 
         pause_btn = ctk.CTkButton(
-            btn_box, text="Pause", width=60, height=26,
-            font=ctk.CTkFont(size=11),
+            btn_box, text="Pause", width=55, height=24,
+            font=ctk.CTkFont(size=10),
             fg_color=C["yellow"], hover_color="#ca8a04", text_color="#000",
             command=lambda: state.request_pause(),
         )
         pause_btn.pack(side="left", padx=2)
 
         stop_btn = ctk.CTkButton(
-            btn_box, text="Stop", width=60, height=26,
-            font=ctk.CTkFont(size=11),
+            btn_box, text="Stop", width=55, height=24,
+            font=ctk.CTkFont(size=10),
             fg_color=C["red"], hover_color="#dc2626", text_color="#fff",
             command=lambda: state.request_stop(),
         )
-        stop_btn.pack(side="left", padx=2)
+        stop_btn.pack(side="left", padx=(2, 0))
 
-        # Row 2: metrics
-        row2 = ctk.CTkFrame(card, fg_color="transparent")
-        row2.pack(fill="x", padx=12, pady=(0, 10))
+        # ── Live game screen (240×160 scaled 1.25x → 300×200) ───────────
+        screen_label = ctk.CTkLabel(win, text="", fg_color=C["bg_dark"])
+        screen_label.pack(pady=(4, 0))
 
-        enc_label = ctk.CTkLabel(row2, text="Enc: 0", font=ctk.CTkFont(size=12), text_color=C["text"], width=120)
-        enc_label.pack(side="left")
-        fps_label = ctk.CTkLabel(row2, text="FPS: 0", font=ctk.CTkFont(size=12), text_color=C["text"], width=120)
+        # Placeholder while waiting for first frame
+        placeholder = ctk.CTkLabel(
+            win,
+            text="Waiting for first frame…\n\nROM required:\nemulator/firered.gba",
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+            fg_color="#111111", width=300, height=200,
+        )
+        placeholder.pack()
+        placeholder_ref = [placeholder]  # mutable ref so update can hide it
+
+        # ── Metrics row ──────────────────────────────────────────────────
+        metrics_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
+        metrics_row.pack(fill="x", side="bottom")
+
+        enc_label = ctk.CTkLabel(
+            metrics_row, text="Enc: 0",
+            font=ctk.CTkFont(size=11), text_color=C["text"], width=90,
+        )
+        enc_label.pack(side="left", padx=(8, 0), pady=4)
+
+        fps_label = ctk.CTkLabel(
+            metrics_row, text="FPS: 0",
+            font=ctk.CTkFont(size=11), text_color=C["text"], width=90,
+        )
         fps_label.pack(side="left")
-        frame_label = ctk.CTkLabel(row2, text="Frames: 0", font=ctk.CTkFont(size=12), text_color=C["text_dim"], width=140)
+
+        frame_label = ctk.CTkLabel(
+            metrics_row, text="Frames: 0",
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"], width=110,
+        )
         frame_label.pack(side="left")
 
-        # Progress bar (visual flair)
         progress = ctk.CTkProgressBar(
-            row2, width=100, height=8,
+            metrics_row, width=60, height=6,
             fg_color=C["border"], progress_color=C["accent"],
         )
-        progress.pack(side="right", padx=(12, 0))
+        progress.pack(side="right", padx=8)
         progress.set(0)
 
-        # Preview
-        preview_label = ctk.CTkLabel(card, text="")
-        preview_label.pack(pady=(0, 8))
-
         self._instance_widgets[inst_id] = {
-            "card": card,
+            "win": win,
             "status": status_label,
             "info": info_label,
+            "screen": screen_label,
+            "placeholder": placeholder_ref,
             "enc": enc_label,
             "fps": fps_label,
             "frames": frame_label,
             "progress": progress,
             "pause": pause_btn,
             "stop": stop_btn,
-            "preview": preview_label,
         }
 
     def _update_card(self, inst_id: int, state: InstanceState):
@@ -1329,51 +1362,83 @@ class App(ctk.CTk):
         if not w:
             return
 
-        # Status
+        win = w.get("win")
+        if win is None:
+            return
+
+        # Status label + window title color
         status_map = {
-            "running": ("RUNNING", C["green"]),
-            "paused": ("PAUSED", C["yellow"]),
-            "shiny_found": ("SHINY!", C["gold"]),
-            "stopped": ("STOPPED", C["red"]),
-            "idle": ("IDLE", C["text_dim"]),
+            "running":    ("RUNNING", C["green"]),
+            "paused":     ("PAUSED",  C["yellow"]),
+            "shiny_found":("SHINY!",  C["gold"]),
+            "stopped":    ("STOPPED", C["red"]),
+            "error":      ("ERROR",   C["red"]),
+            "idle":       ("IDLE",    C["text_dim"]),
         }
         text, color = status_map.get(state.status, ("...", C["text_dim"]))
         w["status"].configure(text=text, text_color=color)
 
-        if state.status == "shiny_found":
-            w["card"].configure(border_color=C["gold"], border_width=2)
+        # Window title reflects status
+        mode_label = BOT_MODES.get(state.bot_mode, {}).get("label", state.bot_mode)
+        win.title(f"[{text}] Instance #{inst_id} – {mode_label}")
+
+        # Error: show in frame_label
+        if state.status == "error" and state.error:
+            w["frames"].configure(
+                text=state.error[:60], text_color=C["red"])
+        else:
+            w["frames"].configure(
+                text=f"Frames: {state.frame_count:,}", text_color=C["text_dim"])
 
         # Metrics
         w["enc"].configure(text=f"Enc: {state.encounters:,}")
         w["fps"].configure(text=f"FPS: {state.fps:,.0f}")
-        w["frames"].configure(text=f"Frames: {state.frame_count:,}")
 
-        # Core info update
+        # Info bar: seed + core
+        info_text = f"#{inst_id}  TID:{state.tid}  SID:{state.sid}"
         if state.cpu_core >= 0:
-            info_text = f"#{inst_id}  |  Seed: 0x{state.seed:04X}  |  TID: {state.tid}  SID: {state.sid}  |  Core {state.cpu_core}"
-            w["info"].configure(text=info_text)
+            info_text += f"  Core:{state.cpu_core}"
+        w["info"].configure(text=info_text)
 
-        # Animated progress (cycles for visual feedback)
+        # Progress bar
         if state.status == "running":
             p = (state.frame_count % 1000) / 1000
             w["progress"].set(p)
+            w["progress"].configure(progress_color=C["accent"])
         elif state.status == "shiny_found":
             w["progress"].set(1.0)
             w["progress"].configure(progress_color=C["gold"])
+        elif state.status == "error":
+            w["progress"].set(1.0)
+            w["progress"].configure(progress_color=C["red"])
 
         # Buttons
         w["pause"].configure(text="Resume" if state.is_paused else "Pause")
-        if state.status in ("stopped", "shiny_found"):
+        if state.status in ("stopped", "shiny_found", "error"):
             w["pause"].configure(state="disabled")
             w["stop"].configure(state="disabled")
 
-        # Preview
-        if self._video_var.get() and state.last_screenshot is not None:
+        # Live screen: update from screenshot captured by worker
+        if state.last_screenshot is not None:
             try:
-                img = state.last_screenshot.resize((240, 160), Image.NEAREST)
+                # Hide placeholder on first real frame
+                ph_ref = w.get("placeholder")
+                if ph_ref and ph_ref[0] is not None:
+                    ph_ref[0].pack_forget()
+                    ph_ref[0] = None
+
+                # Scale 240×160 → 300×200 (1.25x) for visibility
+                img = state.last_screenshot.resize((300, 200), Image.NEAREST)
                 photo = ImageTk.PhotoImage(img)
                 self._photo_cache[inst_id] = photo
-                w["preview"].configure(image=photo)
+                w["screen"].configure(image=photo, text="")
+            except Exception:
+                pass
+
+        # Flash window border gold on shiny
+        if state.status == "shiny_found":
+            try:
+                win.configure(fg_color=C["gold"])
             except Exception:
                 pass
 
@@ -1386,11 +1451,26 @@ class App(ctk.CTk):
             title="Select GBA ROM",
             filetypes=[("GBA ROMs", "*.gba *.bin"), ("All files", "*.*")],
         )
-        if path:
-            self._rom_var.set(path)
-            self.settings["rom_path"] = path
-            save_settings(self.settings)
-            self._validate_rom_display()
+        if not path:
+            return
+        src = Path(path)
+        # Auto-copy ROM into emulator/ so all instances share one canonical path
+        from modules.config import EMULATOR_DIR
+        EMULATOR_DIR.mkdir(parents=True, exist_ok=True)
+        dest = EMULATOR_DIR / src.name
+        if src.resolve() != dest.resolve():
+            try:
+                shutil.copy2(src, dest)
+                self._rom_status.configure(
+                    text=f"Copied → emulator/{src.name}", text_color=C["green"])
+            except Exception as exc:
+                self._rom_status.configure(
+                    text=f"Copy failed: {exc}", text_color=C["red"])
+                dest = src  # fall back to original path
+        self._rom_var.set(str(dest))
+        self.settings["rom_path"] = str(dest)
+        save_settings(self.settings)
+        self._validate_rom_display()
 
     def _validate_rom_display(self):
         rom = self._rom_var.get()
@@ -1432,11 +1512,11 @@ class App(ctk.CTk):
 
         for i in range(count):
             seed = (0x1234 + i * 0x111) & 0xFFFF
-            tid, sid = seed_to_ids(seed)
+            trainer_id = seed_to_ids(seed)
 
             state = InstanceState(
                 instance_id=self._next_id,
-                seed=seed, tid=tid, sid=sid,
+                seed=seed, tid=trainer_id.tid, sid=trainer_id.sid,
                 speed_multiplier=speed, bot_mode=mode,
             )
             iid = self._next_id
