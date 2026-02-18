@@ -738,8 +738,12 @@ def emulator_worker(
                 mode.start()
                 wlog.info("Instance %d  Resumed with mode: %s", iid, _active_mode_key)
 
-            # ── Skip step() for pure manual mode ────────────────────────────
+            # ── Watch mode: game runs, screen updates, no bot/inputs ────────
             if _active_mode_key == "manual":
+                bot.advance_frames(1)
+                state.frame_count = bot.frame_count
+                if state.frame_count % 4 == 0:
+                    _worker_capture_screen(bot, state)
                 time.sleep(0.016)
                 continue
 
