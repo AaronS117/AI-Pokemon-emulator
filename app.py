@@ -623,8 +623,12 @@ def emulator_worker(
             wlog.warning("Instance %d  Will attempt new-game intro sequence, then fall back to MANUAL mode", iid)
 
         bot = GameBot()
-        bot.launch(seed=state.seed, tid=state.tid, sid=state.sid, rom_path=_rom_p)
-        wlog.info("Instance %d  Emulator launched (headless mGBA)", iid)
+        bot.launch(
+            seed=state.seed, tid=state.tid, sid=state.sid,
+            rom_path=_rom_p, instance_id=iid, speed=speed,
+        )
+        wlog.info("Instance %d  Emulator launched (headless mGBA)  save=emulator/saves/%d/%s.sav  speed=%s",
+                  iid, iid, _rom_p.stem, f"{speed}x" if speed > 0 else "max")
 
         # ── Boot sequence ─────────────────────────────────────────────────
         if not _has_save:
@@ -1777,6 +1781,8 @@ class App(ctk.CTk):
         )
         ctrl_btn.pack(side="left", padx=(2, 0))
         ctrl_btn_ref[0] = ctrl_btn
+        self._ctrl_btn_refs = getattr(self, "_ctrl_btn_refs", {})
+        self._ctrl_btn_refs[inst_id] = ctrl_btn_ref
 
         # ── Live game screen (240×160 scaled 1.25x → 300×200) ───────────
         screen_label = ctk.CTkLabel(win, text="", fg_color=C["bg_dark"])
@@ -1849,6 +1855,7 @@ class App(ctk.CTk):
             "enc": enc_label,
             "fps": fps_label,
             "frames": frame_label,
+            "ctrl_btn_ref": ctrl_btn_ref,
             "progress": progress,
             "pause": pause_btn,
             "stop": stop_btn,
@@ -1894,8 +1901,9 @@ class App(ctk.CTk):
         w["enc"].configure(text=f"Enc: {state.encounters:,}")
         w["fps"].configure(text=f"FPS: {state.fps:,.0f}")
 
-        # Info bar: seed + core
-        info_text = f"#{inst_id}  TID:{state.tid}  SID:{state.sid}"
+        # Info bar: instance#, TID, SID, save path, speed, core
+        speed_str = f"{state.speed_multiplier}x" if state.speed_multiplier > 0 else "max"
+        info_text = f"#{inst_id}  TID:{state.tid}  SID:{state.sid}  spd:{speed_str}"
         if state.cpu_core >= 0:
             info_text += f"  Core:{state.cpu_core}"
         w["info"].configure(text=info_text)
@@ -1917,6 +1925,20 @@ class App(ctk.CTk):
         if state.status in ("stopped", "shiny_found", "error"):
             w["pause"].configure(state="disabled")
             w["stop"].configure(state="disabled")
+
+        # Sync Control button appearance to actual manual_control state
+        # (worker may auto-set it without the button being clicked)
+        ctrl_ref = w.get("ctrl_btn_ref")
+        if ctrl_ref and ctrl_ref[0] is not None:
+            try:
+                if state.manual_control:
+                    ctrl_ref[0].configure(
+                        text="▶ Bot", fg_color=C["accent"], text_color="#fff")
+                else:
+                    ctrl_ref[0].configure(
+                        text="Control", fg_color="#1e3a5f", text_color=C["text"])  
+            except Exception:
+                pass
 
         # Live screen: update from screenshot captured by worker
         if state.last_screenshot is not None:

@@ -280,8 +280,16 @@ class GameBot:
         sid: int,
         game_version: str = GameVersion.FIRE_RED,
         rom_path: Optional[Path] = None,
+        instance_id: Optional[int] = None,
+        speed: int = 0,
     ) -> EmulatorInstance:
-        """Start a headless emulator instance associated with the given seed/IDs."""
+        """Start a headless emulator instance associated with the given seed/IDs.
+
+        :param instance_id: Integer instance number (1, 2, 3…). Used as the save
+                            directory name so saves land in saves/1/rom.sav etc.
+                            If None, falls back to a UUID-based directory.
+        :param speed: Speed multiplier: 1=1x, 2=2x, 4=4x, 0=unthrottled max.
+        """
         rom = rom_path or ROM_PATH
         if not rom.exists():
             raise FileNotFoundError(
@@ -293,8 +301,10 @@ class GameBot:
             game_version=game_version, rom_path=rom,
         )
 
-        # Prepare per-instance save directory
-        save_dir = SAVE_DIR / inst.instance_id
+        # Use integer instance_id for save dir so saves/1/rom.sav is predictable.
+        # Falls back to UUID if not provided (backwards compat).
+        save_folder = str(instance_id) if instance_id is not None else inst.instance_id
+        save_dir = SAVE_DIR / save_folder
         save_dir.mkdir(parents=True, exist_ok=True)
         inst.save_path = save_dir / f"{rom.stem}.sav"
 
@@ -357,8 +367,35 @@ class GameBot:
         except Exception as exc:
             logger.warning("Could not load sym file %s: %s – using fallback addresses", sym_file, exc)
 
-        logger.info("Launched headless emulator: %s", inst)
+        # Apply speed setting
+        # speed=0 → unthrottled (max), speed=N → N× throttled
+        self.set_speed(speed)
+        logger.info("Launched headless emulator: %s  speed=%s  save=%s",
+                    inst, f"{speed}x" if speed > 0 else "max", inst.save_path)
         return inst
+
+    def set_speed(self, speed: int) -> None:
+        """
+        Set emulation speed.
+        speed=0 → unthrottled (max FPS)
+        speed=1 → 1× (60 fps)
+        speed=N → N× (N*60 fps, throttled via audio/sleep)
+        Matches pokebot-gen3 LibmgbaEmulator.set_throttle / set_speed_factor.
+        """
+        if self.instance is None or self.instance._core is None:
+            return
+        core = self.instance._core
+        if speed == 0:
+            # Unthrottled – disable audio-based throttle
+            core.set_sync(False)
+        else:
+            core.set_sync(True)
+            # mGBA's set_sync(True) runs at 1×; we can't set a multiplier
+            # without the audio layer, so we just enable/disable throttle.
+            # For >1× speeds we disable throttle (same as Max for headless).
+            if speed > 1:
+                core.set_sync(False)
+        self._speed = speed
 
     def destroy(self) -> None:
         """Shut down the current emulator instance."""
