@@ -203,7 +203,7 @@ FIREREED_SYMBOLS: Dict[str, Tuple[int, int]] = {
     "GSAVEBLOCK1PTR":      (0x03005008, 4),
     "GSAVEBLOCK2PTR":      (0x0300500C, 4),
     "GPLAYERPARTY":        (0x02024284, 600),
-    "GPLAYERPARTYCOUNT":   (0x02024280, 4),
+    "GPLAYERPARTYCOUNT":   (0x02024029, 1),
     "GENEMYPARTY":         (0x0202402C, 600),
     "GBATTLEOUTCOME":      (0x02023E8A, 1),
     "GBATTLETYPEFLAGS":    (0x02022B4C, 4),
@@ -385,10 +385,11 @@ class GameBot:
         # Load the correct symbol table from the .sym file
         # Detect game from ROM filename (case-insensitive)
         rom_stem = rom.stem.upper()
+        _is_rev1 = "REV 1" in rom_stem or "REV1" in rom_stem
         if "FIRERED" in rom_stem or "FIRE" in rom_stem:
-            sym_file = "pokefirered.sym"
+            sym_file = "pokefirered_rev1.sym" if _is_rev1 else "pokefirered.sym"
         elif "LEAFGREEN" in rom_stem or "LEAF" in rom_stem:
-            sym_file = "pokeleafgreen.sym"
+            sym_file = "pokeleafgreen_rev1.sym" if _is_rev1 else "pokeleafgreen.sym"
         elif "EMERALD" in rom_stem:
             sym_file = "pokeemerald.sym"
         elif "RUBY" in rom_stem:
@@ -664,10 +665,10 @@ class GameBot:
         return (data[0], data[1])
 
     def get_party_count(self) -> int:
-        """Read the current party Pokémon count."""
+        """Read the current party Pokémon count (1 byte per sym file)."""
         try:
-            addr, _ = self._sym("gPlayerPartyCount")
-            return struct.unpack("<I", self.read_bytes(addr, 4))[0]
+            data = self.read_symbol("gPlayerPartyCount")
+            return data[0]
         except Exception:
             return 0
 
@@ -678,10 +679,14 @@ class GameBot:
         Holds d-pad buttons until coordinates match, like pokebot-gen3's walk_to().
         Returns True if reached, False if timed out.
         """
-        for _ in range(timeout_frames):
+        for i in range(timeout_frames):
             x, y = self.get_player_coords()
+            if i % 30 == 0:
+                logger.debug("[walk_to] frame %d/%d  pos=(%d,%d)  target=(%d,%d)",
+                             i, timeout_frames, x, y, target_x, target_y)
             if x == target_x and y == target_y:
                 self.release_all()
+                logger.debug("[walk_to] Reached target (%d,%d) after %d frames", target_x, target_y, i)
                 return True
             self._held_inputs = 0
             if run:
@@ -696,6 +701,8 @@ class GameBot:
                 self._held_inputs |= (1 << GBAButton.DOWN)
             self._apply_inputs_and_run_frame()
         self.release_all()
+        logger.debug("[walk_to] Timed out after %d frames  pos=(%d,%d)  target=(%d,%d)",
+                     timeout_frames, *self.get_player_coords(), target_x, target_y)
         return False
 
     def face_direction(self, direction: str, frames: int = 4) -> None:

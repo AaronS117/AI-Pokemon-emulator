@@ -1587,13 +1587,25 @@ class App(ctk.CTk):
                          font=ctk.CTkFont(size=11),
                          text_color=C["yellow"]).pack(anchor="w", pady=(4, 0))
 
-            # Scan for shiny PIDs
+            # Generate sample shiny PIDs.
+            # Shiny condition: (TID ^ SID ^ PID_hi ^ PID_lo) < 8
+            # So for each PID_hi, the valid PID_lo values are:
+            #   PID_lo = PID_hi ^ xor_val ^ sv  where sv in [0..7]
+            _NATURES = [
+                "Hardy","Lonely","Brave","Adamant","Naughty",
+                "Bold","Docile","Relaxed","Impish","Lax",
+                "Timid","Hasty","Serious","Jolly","Naive",
+                "Modest","Mild","Quiet","Bashful","Rash",
+                "Calm","Gentle","Sassy","Careful","Quirky",
+            ]
             shiny_pids = []
             for _hi in range(0, 0x10000):
-                for _lo in range(max(0, _hi - 7), min(0x10000, _hi + 8)):
-                    pv = (_hi << 16) | _lo
-                    if tid_obj.is_shiny_pid(pv):
-                        shiny_pids.append(f"0x{pv:08X}")
+                for _sv in range(8):
+                    _lo = _hi ^ xor_val ^ _sv
+                    if 0 <= _lo <= 0xFFFF:
+                        pv = (_hi << 16) | _lo
+                        nature = _NATURES[pv % 25]
+                        shiny_pids.append((pv, _sv, nature))
                 if len(shiny_pids) >= 16:
                     break
 
@@ -1602,11 +1614,12 @@ class App(ctk.CTk):
                          text_color=C["text"]).pack(anchor="w", pady=(8, 2))
             pid_grid = ctk.CTkFrame(body, fg_color="transparent")
             pid_grid.pack(anchor="w")
-            for i, pid_str in enumerate(shiny_pids[:16]):
-                ctk.CTkLabel(pid_grid, text=pid_str,
+            for i, (pv, sv, nature) in enumerate(shiny_pids[:16]):
+                txt = f"0x{pv:08X}  sv={sv}  {nature}"
+                ctk.CTkLabel(pid_grid, text=txt,
                              font=ctk.CTkFont(family="Courier New", size=10),
                              text_color=C["gold"],
-                             width=110).grid(row=i // 4, column=i % 4, padx=4, pady=1, sticky="w")
+                             width=260).grid(row=i // 2, column=i % 2, padx=4, pady=1, sticky="w")
 
             ctk.CTkLabel(body,
                          text="For perfect IVs: use PokeFinder → Stationary/Wild RNG → enter TID/SID above.",

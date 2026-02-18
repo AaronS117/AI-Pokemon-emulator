@@ -155,18 +155,25 @@ class EncounterFarmMode(BotMode):
 
 class StarterResetMode(BotMode):
     """
-    Soft-reset loop for shiny starters.
+    Soft-reset loop for shiny starters (FireRed/LeafGreen new-game flow).
 
-    Ported from pokebot-gen3's starters.py:
-      1. Soft reset → mash A through intro/title/continue
-      2. Wait for overworld
-      3. Walk to the correct pokeball on the table
-      4. Face up and press A to interact
-      5. Mash A until party count > 0 (starter received)
-      6. Read party slot 0 and check shininess
-      7. If not shiny → soft reset and repeat
+    After a soft reset the game starts a NEW GAME from scratch:
+      1. Title screen → mash A through Oak's intro speech
+      2. Naming screen → skip (already handled by app.py intro sequence)
+      3. Player spawns in bedroom at (17, 12) in Pallet Town
+      4. Walk downstairs, exit house, walk north toward Route 1
+      5. Oak cutscene triggers → Oak takes you to his lab (scripted)
+      6. Oak talks, tells you to pick a starter → mash A
+      7. Player gains control in Oak's Lab → walk to pokeball
+      8. Face up, press A to interact → confirm selection
+      9. Read party slot 0, check shininess
+     10. If not shiny → soft reset and repeat
 
-    FRLG Oak's Lab pokeball coordinates (from pokefirered decompilation):
+    NOTE: pokebot-gen3 requires a save file already in Oak's Lab.
+    We handle the full new-game flow instead, which is slower but
+    works without any save file.
+
+    FRLG Oak's Lab pokeball coordinates (pokefirered decompilation):
       Bulbasaur = (8, 5)   Squirtle = (9, 5)   Charmander = (10, 5)
     """
 
@@ -180,11 +187,26 @@ class StarterResetMode(BotMode):
         2: (10, 5),  # Charmander (right)
     }
 
+    # Map group/number constants (FRLG)
+    _MAP_OAKS_LAB = (4, 3)        # Pallet Town - Professor Oak's Lab
+    _MAP_PLAYER_HOUSE_1F = (4, 1) # Pallet Town - Player's House 1F
+    _MAP_PALLET_TOWN = (3, 0)     # Pallet Town (overworld)
+
     def __init__(self, bot: GameBot, starter_index: int = 0):
         super().__init__(bot)
         self.starter_index = starter_index  # 0=left, 1=middle, 2=right
         self._phase = "reset"
         self._wait_frames = 0
+        self._has_save = False  # set True once we detect a save file exists
+
+    def _log(self, msg, *args):
+        logger.info("[StarterReset] " + msg, *args)
+
+    def _mash_a(self, count: int = 1, gap: int = 10):
+        """Press A count times with gap frames between."""
+        for _ in range(count):
+            self.bot.press_button(GBAButton.A)
+            self.bot.advance_frames(gap)
 
     def step(self) -> ModeResult:
         if self.status != ModeStatus.RUNNING:
@@ -193,75 +215,181 @@ class StarterResetMode(BotMode):
         # ── Phase: reset ──────────────────────────────────────────────────
         if self._phase == "reset":
             fc = self.bot.frame_count
-            logger.info("[StarterReset] Soft reset #%d at frame %d",
-                        self.encounters + 1, fc)
+            self._log("Soft reset #%d at frame %d", self.encounters + 1, fc)
             self.bot.soft_reset()
             self._phase = "skip_intro"
             self._wait_frames = 0
             return ModeResult(status=ModeStatus.RUNNING,
-                              message=f"Soft resetting... (reset #{self.encounters+1}, frame {fc})")
+                              message=f"Soft resetting... (reset #{self.encounters+1})")
 
         # ── Phase: skip_intro ─────────────────────────────────────────────
+        # Mash A through title screen, Oak intro, naming, etc.
+        # until we reach the overworld (either bedroom or Oak's Lab if saved there)
         elif self._phase == "skip_intro":
-            # Mash A to get through intro/title/continue screens
-            self.bot.press_button(GBAButton.A)
-            self.bot.advance_frames(10)
+            self._mash_a(1, 10)
             self._wait_frames += 1
 
-            # After enough A-presses, check if we're in the overworld
-            if self._wait_frames > 60:
+            if self._wait_frames > 30:
                 state = self.bot.get_game_state()
                 if state == GameState.OVERWORLD:
                     try:
                         coords = self.bot.get_player_coords()
-                        facing = self.bot.get_player_facing()
-                        logger.info("[StarterReset] Overworld reached at frame %d  pos=%s facing=%s",
-                                    self.bot.frame_count, coords, facing)
-                    except Exception:
-                        logger.info("[StarterReset] Overworld reached at frame %d",
-                                    self.bot.frame_count)
-                    self._phase = "walk_to_pokeball"
-                    self._wait_frames = 0
+                        map_gn = self.bot.get_player_map()
+                        self._log("Overworld at frame %d  pos=%s  map=%s",
+                                  self.bot.frame_count, coords, map_gn)
 
-            if self._wait_frames > 200:
-                logger.warning("[StarterReset] Intro skip timed out at frame %d – resetting",
-                               self.bot.frame_count)
+                        # If we're already in Oak's Lab (save file was there), skip navigation
+                        if map_gn == self._MAP_OAKS_LAB:
+                            self._has_save = True
+                            self._log("Already in Oak's Lab (from save) – going to pokeball")
+                            self._phase = "walk_to_pokeball"
+                            self._wait_frames = 0
+                        else:
+                            # New game: player is in bedroom or house
+                            self._phase = "navigate_to_oak"
+                            self._wait_frames = 0
+                    except Exception as e:
+                        self._log("Overworld reached but coords failed: %s", e)
+                        self._phase = "navigate_to_oak"
+                        self._wait_frames = 0
+
+            if self._wait_frames > 300:
+                self._log("Intro skip timed out at frame %d – resetting", self.bot.frame_count)
+                self._phase = "reset"
+
+            return ModeResult(status=ModeStatus.RUNNING, message="Skipping intro...")
+
+        # ── Phase: navigate_to_oak ────────────────────────────────────────
+        # Full new-game navigation: bedroom → downstairs → outside → north → Oak cutscene
+        elif self._phase == "navigate_to_oak":
+            self._log("Navigating new-game flow at frame %d", self.bot.frame_count)
+
+            # Step 1: Walk down from bedroom to stairs
+            # Player starts at roughly (17, 12) facing down in bedroom (2F)
+            # The stairs are at the bottom of the room
+            self._log("Step 1: Walking down to exit bedroom...")
+            self.bot.hold_button(GBAButton.DOWN)
+            for i in range(60):
+                self.bot._apply_inputs_and_run_frame()
+            self.bot.release_all()
+            self.bot.advance_frames(30)  # wait for map transition
+
+            # Step 2: Walk down to exit the house (1F)
+            self._log("Step 2: Walking down to exit house...")
+            self.bot.hold_button(GBAButton.DOWN)
+            for i in range(90):
+                self.bot._apply_inputs_and_run_frame()
+            self.bot.release_all()
+            self.bot.advance_frames(30)  # wait for map transition
+
+            # Step 3: Walk north in Pallet Town toward Route 1
+            # This triggers Oak's cutscene where he stops you
+            self._log("Step 3: Walking north to trigger Oak cutscene...")
+            self.bot.hold_button(GBAButton.UP)
+            for i in range(120):
+                self.bot._apply_inputs_and_run_frame()
+            self.bot.release_all()
+
+            self._phase = "oak_cutscene"
+            self._wait_frames = 0
+            return ModeResult(status=ModeStatus.RUNNING,
+                              message="Walking to trigger Oak...")
+
+        # ── Phase: oak_cutscene ───────────────────────────────────────────
+        # Oak stops you, walks you to his lab, gives a speech.
+        # Just mash A through all of it until we're in the overworld in Oak's Lab.
+        elif self._phase == "oak_cutscene":
+            self._mash_a(1, 5)
+            self._wait_frames += 1
+
+            # Check periodically if we're in Oak's Lab overworld
+            if self._wait_frames % 20 == 0:
+                state = self.bot.get_game_state()
+                if state == GameState.OVERWORLD:
+                    try:
+                        map_gn = self.bot.get_player_map()
+                        coords = self.bot.get_player_coords()
+                        if map_gn == self._MAP_OAKS_LAB:
+                            self._log("In Oak's Lab! pos=%s  frame %d", coords, self.bot.frame_count)
+                            # Oak tells you to pick a starter — keep mashing A
+                            # until the player can move freely
+                            self._phase = "wait_for_control"
+                            self._wait_frames = 0
+                    except Exception:
+                        pass
+
+            if self._wait_frames > 600:
+                self._log("Oak cutscene timed out at frame %d – resetting", self.bot.frame_count)
                 self._phase = "reset"
 
             return ModeResult(status=ModeStatus.RUNNING,
-                              message="Skipping intro...")
+                              message="Oak cutscene...")
+
+        # ── Phase: wait_for_control ───────────────────────────────────────
+        # In Oak's Lab, Oak talks and tells you to pick a starter.
+        # Mash A until we can actually move (overworld + no script running).
+        elif self._phase == "wait_for_control":
+            self._mash_a(1, 5)
+            self._wait_frames += 1
+
+            # Try to detect when we have free movement by checking if
+            # coordinates change when we press a direction
+            if self._wait_frames % 10 == 0 and self._wait_frames > 30:
+                try:
+                    state = self.bot.get_game_state()
+                    coords = self.bot.get_player_coords()
+                    if state == GameState.OVERWORLD:
+                        # Try pressing up briefly and see if we can move
+                        old_coords = coords
+                        self.bot._pressed_inputs = 1 << GBAButton.UP.value
+                        for _ in range(16):
+                            self.bot._apply_inputs_and_run_frame()
+                        self.bot._pressed_inputs = 0
+                        self.bot.advance_frames(8)
+                        new_coords = self.bot.get_player_coords()
+                        if new_coords != old_coords:
+                            self._log("Player can move! pos=%s→%s  frame %d",
+                                      old_coords, new_coords, self.bot.frame_count)
+                            self._phase = "walk_to_pokeball"
+                            self._wait_frames = 0
+                except Exception:
+                    pass
+
+            if self._wait_frames > 400:
+                self._log("Wait for control timed out at frame %d – resetting", self.bot.frame_count)
+                self._phase = "reset"
+
+            return ModeResult(status=ModeStatus.RUNNING,
+                              message="Waiting for Oak to finish talking...")
 
         # ── Phase: walk_to_pokeball ───────────────────────────────────────
         elif self._phase == "walk_to_pokeball":
             target_x, target_y = self._STARTER_COORDS.get(self.starter_index, (8, 5))
-            logger.info("[StarterReset] Walking to pokeball at (%d, %d)  frame %d",
-                        target_x, target_y, self.bot.frame_count)
-            reached = self.bot.walk_to(target_x, target_y, timeout_frames=300)
+            self._log("Walking to pokeball at (%d, %d)  frame %d",
+                      target_x, target_y, self.bot.frame_count)
+            reached = self.bot.walk_to(target_x, target_y, timeout_frames=600)
             if reached:
                 try:
                     coords = self.bot.get_player_coords()
-                    logger.info("[StarterReset] Reached pokeball at %s  frame %d",
-                                coords, self.bot.frame_count)
+                    self._log("Reached pokeball at %s  frame %d", coords, self.bot.frame_count)
                 except Exception:
                     pass
                 self._phase = "face_and_interact"
                 self._wait_frames = 0
             else:
-                logger.warning("[StarterReset] Walk to pokeball timed out at frame %d – resetting",
-                               self.bot.frame_count)
+                self._log("Walk to pokeball timed out at frame %d – resetting",
+                          self.bot.frame_count)
                 self._phase = "reset"
             return ModeResult(status=ModeStatus.RUNNING,
                               message="Walking to pokeball...")
 
         # ── Phase: face_and_interact ──────────────────────────────────────
         elif self._phase == "face_and_interact":
-            # Face up toward the table, then press A to interact
             self.bot.face_direction("up")
             self.bot.advance_frames(10)
             self.bot.press_button(GBAButton.A)
             self.bot.advance_frames(30)
-            logger.info("[StarterReset] Interacted with pokeball at frame %d",
-                        self.bot.frame_count)
+            self._log("Interacted with pokeball at frame %d", self.bot.frame_count)
             self._phase = "confirm_starter"
             self._wait_frames = 0
             return ModeResult(status=ModeStatus.RUNNING,
@@ -269,16 +397,13 @@ class StarterResetMode(BotMode):
 
         # ── Phase: confirm_starter ────────────────────────────────────────
         elif self._phase == "confirm_starter":
-            # Mash A to confirm "Do you want this Pokémon?" dialog
-            # and decline nickname, until party count > 0
-            self.bot.press_button(GBAButton.A)
-            self.bot.advance_frames(10)
+            self._mash_a(1, 10)
             self._wait_frames += 1
 
             party_count = self.bot.get_party_count()
             if party_count > 0:
-                logger.info("[StarterReset] Starter received! party=%d  frame %d",
-                            party_count, self.bot.frame_count)
+                self._log("Starter received! party=%d  frame %d",
+                          party_count, self.bot.frame_count)
                 # Decline nickname with B, then wait for dialog to finish
                 self.bot.press_button(GBAButton.B)
                 self.bot.advance_frames(30)
@@ -289,8 +414,8 @@ class StarterResetMode(BotMode):
                                   message="Starter received, checking...")
 
             if self._wait_frames > 300:
-                logger.warning("[StarterReset] Starter confirm timed out at frame %d – resetting",
-                               self.bot.frame_count)
+                self._log("Starter confirm timed out at frame %d – resetting",
+                          self.bot.frame_count)
                 self._phase = "reset"
 
             return ModeResult(status=ModeStatus.RUNNING,
@@ -307,8 +432,8 @@ class StarterResetMode(BotMode):
                 sid = (ot >> 16) & 0xFFFF
                 is_shiny = (tid ^ sid ^ (pv >> 16) ^ (pv & 0xFFFF)) < 8
 
-                logger.info("[StarterReset] Reset #%d  PV=0x%08X  TID=%d  SID=%d  shiny=%s  frame %d",
-                            self.encounters, pv, tid, sid, is_shiny, self.bot.frame_count)
+                self._log("Reset #%d  PV=0x%08X  TID=%d  SID=%d  shiny=%s  frame %d",
+                          self.encounters, pv, tid, sid, is_shiny, self.bot.frame_count)
 
                 if is_shiny:
                     self.shinies_found += 1
