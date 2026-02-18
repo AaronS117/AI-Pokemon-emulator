@@ -443,107 +443,134 @@ def _worker_capture_screen(bot, state) -> None:
 
 def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RED") -> bool:
     """
-    Attempt to navigate the new-game intro sequence for Fire Red.
-    Types the player name and advances through Oak's speech.
+    Navigate the Fire Red new-game intro sequence automatically.
+
+    Strategy: use get_game_state() with the corrected detection logic.
+    Fall back to frame-count heuristics if state stays UNKNOWN.
     Returns True if we reach OVERWORLD/CHOOSE_STARTER, False on timeout.
     """
     iid = state.instance_id
-    logger.info("[Instance %d] Fresh save detected – starting new-game intro sequence", iid)
-    logger.info("[Instance %d] Will type player name: %s", iid, player_name)
+    logger.info("[Instance %d] Fresh save – starting new-game intro sequence", iid)
+    logger.info("[Instance %d] Player name: %s", iid, player_name)
 
-    # GBA character map for the naming screen (Fire Red A-Z row)
+    # Fire Red naming screen: uppercase A-Z laid out in rows of 9
+    # Row 0: A B C D E F G H I  (indices 0-8)
+    # Row 1: J K L M N O P Q R  (indices 9-17)
+    # Row 2: S T U V W X Y Z    (indices 18-25)
     CHAR_MAP = {c: i for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}
-    # Fire Red naming screen layout: 9 chars per row, A=col0 row0
     CHARS_PER_ROW = 9
 
-    def _press_stop():
+    def _stop():
         return state.should_stop
 
-    # Step 1: Advance through intro (Game Freak logo, title screen)
-    logger.info("[Instance %d] Advancing through intro screens (pressing A)…", iid)
-    for _ in range(300):
-        if _press_stop():
-            return False
-        bot.press_button(GBAButton.A)
-        bot.advance_frames(8)
+    def _advance(frames, press=None):
+        """Advance frames, optionally pressing a button, and update state."""
+        if press is not None:
+            bot.press_button(press)
+        else:
+            bot.advance_frames(frames)
         state.frame_count = bot.frame_count
-        gs = bot.get_game_state()
-        if gs == GState.MAIN_MENU:
-            break
 
-    # Step 2: Start new game from main menu
-    logger.info("[Instance %d] Selecting 'New Game' from main menu", iid)
-    for _ in range(60):
-        if _press_stop():
-            return False
+    def _gs():
+        return bot.get_game_state()
+
+    def _log_state(label):
+        gs = _gs()
+        logger.info("[Instance %d] %s  game_state=%s  frame=%d", iid, label, gs.name, bot.frame_count)
+        return gs
+
+    # ── Phase 1: Title screen → press A until play-time counter starts ───
+    # The title screen runs until the player presses A/Start.
+    # We know we're past it when get_game_state() != TITLE_SCREEN.
+    logger.info("[Instance %d] Phase 1: waiting for title screen to clear…", iid)
+    for f in range(600):   # up to ~10s at 60fps
+        if _stop(): return False
         bot.press_button(GBAButton.A)
         bot.advance_frames(10)
         state.frame_count = bot.frame_count
+        if f % 60 == 0:
+            gs = _log_state(f"Phase1 f={f*10}")
+            _worker_capture_screen(bot, state)
+            if gs != GState.TITLE_SCREEN and gs != GState.UNKNOWN:
+                logger.info("[Instance %d] Title screen cleared → %s", iid, gs.name)
+                break
+    else:
+        logger.warning("[Instance %d] Phase 1 timed out (still on title/unknown)", iid)
 
-    # Step 3: Skip Oak's intro speech (keep pressing A/B)
-    logger.info("[Instance %d] Skipping Oak's intro speech…", iid)
-    for _ in range(400):
-        if _press_stop():
-            return False
+    # ── Phase 2: Oak's intro speech → keep pressing A until NAMING_SCREEN ─
+    # Oak talks for ~300-500 frames of A-presses before the naming screen.
+    logger.info("[Instance %d] Phase 2: skipping Oak's intro speech…", iid)
+    for f in range(800):
+        if _stop(): return False
         bot.press_button(GBAButton.A)
-        bot.advance_frames(6)
+        bot.advance_frames(8)
         state.frame_count = bot.frame_count
-        gs = bot.get_game_state()
-        if gs == GState.NAMING_SCREEN:
-            logger.info("[Instance %d] Reached naming screen", iid)
-            break
+        if f % 60 == 0:
+            gs = _log_state(f"Phase2 f={f*8}")
+            _worker_capture_screen(bot, state)
+            if gs == GState.NAMING_SCREEN:
+                logger.info("[Instance %d] Naming screen detected!", iid)
+                break
+            if gs in (GState.OVERWORLD, GState.CHOOSE_STARTER):
+                logger.info("[Instance %d] Skipped naming screen, already at %s", iid, gs.name)
+                return True
+    else:
+        logger.warning("[Instance %d] Phase 2 timed out – naming screen not detected, attempting name entry anyway", iid)
 
-    # Step 4: Type player name on naming screen
-    logger.info("[Instance %d] Typing player name '%s'…", iid, player_name)
+    # ── Phase 3: Type player name ─────────────────────────────────────────
+    # Give the naming screen a moment to fully render
+    bot.advance_frames(30)
+    logger.info("[Instance %d] Phase 3: typing name '%s'", iid, player_name)
     cur_col, cur_row = 0, 0
     for ch in player_name.upper():
-        if _press_stop():
-            return False
+        if _stop(): return False
         if ch not in CHAR_MAP:
             continue
         target_idx = CHAR_MAP[ch]
         target_col = target_idx % CHARS_PER_ROW
         target_row = target_idx // CHARS_PER_ROW
-        # Navigate to character
         dc = target_col - cur_col
         dr = target_row - cur_row
         for _ in range(abs(dr)):
-            btn = GBAButton.DOWN if dr > 0 else GBAButton.UP
-            bot.press_button(btn)
-            bot.advance_frames(4)
+            bot.press_button(GBAButton.DOWN if dr > 0 else GBAButton.UP)
+            bot.advance_frames(6)
         for _ in range(abs(dc)):
-            btn = GBAButton.RIGHT if dc > 0 else GBAButton.LEFT
-            bot.press_button(btn)
-            bot.advance_frames(4)
+            bot.press_button(GBAButton.RIGHT if dc > 0 else GBAButton.LEFT)
+            bot.advance_frames(6)
         bot.press_button(GBAButton.A)
-        bot.advance_frames(6)
+        bot.advance_frames(8)
         cur_col, cur_row = target_col, target_row
         state.frame_count = bot.frame_count
-        logger.debug("[Instance %d] Typed '%s'", iid, ch)
+        logger.debug("[Instance %d] Typed '%s' (col=%d row=%d)", iid, ch, target_col, target_row)
 
-    # Confirm name (navigate to OK button – bottom row)
-    logger.info("[Instance %d] Confirming name", iid)
-    for _ in range(5):
+    # Navigate to the OK button (bottom-right of naming screen)
+    logger.info("[Instance %d] Confirming name…", iid)
+    for _ in range(4):
         bot.press_button(GBAButton.DOWN)
-        bot.advance_frames(4)
-    bot.press_button(GBAButton.A)
-    bot.advance_frames(30)
+        bot.advance_frames(6)
+    for _ in range(8):
+        bot.press_button(GBAButton.RIGHT)
+        bot.advance_frames(6)
+    bot.press_button(GBAButton.A)   # OK
+    bot.advance_frames(60)
+    _worker_capture_screen(bot, state)
+    _log_state("After name confirm")
 
-    # Step 5: Skip remaining cutscenes until overworld/choose starter
-    logger.info("[Instance %d] Skipping post-name cutscenes…", iid)
-    for _ in range(600):
-        if _press_stop():
-            return False
+    # ── Phase 4: Post-name cutscenes → keep pressing A until OVERWORLD ────
+    logger.info("[Instance %d] Phase 4: skipping post-name cutscenes…", iid)
+    for f in range(1200):
+        if _stop(): return False
         bot.press_button(GBAButton.A)
         bot.advance_frames(8)
         state.frame_count = bot.frame_count
-        _worker_capture_screen(bot, state)
-        gs = bot.get_game_state()
-        if gs in (GState.OVERWORLD, GState.CHOOSE_STARTER):
-            logger.info("[Instance %d] Reached playable state: %s", iid, gs.name)
-            return True
+        if f % 60 == 0:
+            gs = _log_state(f"Phase4 f={f*8}")
+            _worker_capture_screen(bot, state)
+            if gs in (GState.OVERWORLD, GState.CHOOSE_STARTER):
+                logger.info("[Instance %d] Reached playable state: %s", iid, gs.name)
+                return True
 
-    logger.warning("[Instance %d] New-game intro timed out – switching to manual mode", iid)
+    logger.warning("[Instance %d] Intro sequence timed out after all phases – falling back to manual", iid)
     return False
 
 
@@ -660,31 +687,31 @@ def emulator_worker(
             while (state.is_paused or state.manual_control) and not state.should_stop:
                 if state.manual_control:
                     state.status = "manual"
-                    # Drain queued manual inputs and send to emulator
+                    _btn_map = {
+                        "a": GBAButton.A, "b": GBAButton.B,
+                        "start": GBAButton.START, "select": GBAButton.SELECT,
+                        "up": GBAButton.UP, "down": GBAButton.DOWN,
+                        "left": GBAButton.LEFT, "right": GBAButton.RIGHT,
+                        "l": GBAButton.L, "r": GBAButton.R,
+                    }
+                    # Drain any queued button presses
                     import queue as _queue
+                    _pressed_any = False
                     while True:
                         try:
                             btn_name = state._input_queue.get_nowait()
-                            _btn_map = {
-                                "a": GBAButton.A, "b": GBAButton.B,
-                                "start": GBAButton.START, "select": GBAButton.SELECT,
-                                "up": GBAButton.UP, "down": GBAButton.DOWN,
-                                "left": GBAButton.LEFT, "right": GBAButton.RIGHT,
-                                "l": GBAButton.L, "r": GBAButton.R,
-                            }
                             gbtn = _btn_map.get(btn_name.lower())
                             if gbtn is not None:
                                 bot.press_button(gbtn, hold_frames=4)
-                                state.frame_count = bot.frame_count
-                                # Capture screenshot after input
-                                try:
-                                    sc = bot.get_screenshot()
-                                    if sc:
-                                        state.last_screenshot = sc
-                                except Exception:
-                                    pass
+                                _pressed_any = True
                         except _queue.Empty:
                             break
+                    # Always advance at least 1 frame so the game keeps running
+                    # and the screen stays live (fixes blank screen in manual mode)
+                    bot.advance_frames(1)
+                    state.frame_count = bot.frame_count
+                    # Capture screenshot every frame in manual mode
+                    _worker_capture_screen(bot, state)
                     time.sleep(0.016)  # ~60fps polling
                 else:
                     state.status = "paused"

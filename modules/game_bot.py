@@ -350,29 +350,49 @@ class GameBot:
 
     def get_game_state(self) -> GameState:
         """
-        Determine the current game state by reading gMain.callback2.
+        Determine the current game state by reading gMain and save-block data.
 
-        Reads the function pointer at gMain + 4 and checks whether it
-        falls within known ROM address ranges for battle callbacks.
+        Detection priority:
+          1. Battle flags / outcome  → BATTLE / BATTLE_ENDING
+          2. play-time counter == 0  → TITLE_SCREEN (no save loaded yet)
+          3. gSaveBlock2 player name all-zero → NAMING_SCREEN (new game, name entry)
+          4. gSaveBlock1 map bank/map == 0 and save block valid → CHOOSE_STARTER
+          5. Otherwise              → OVERWORLD
         """
         try:
-            cb2 = self.read_u32(FIRERED_SYMBOLS["gMain"][0] + 4)
-            # Quick heuristic: Fire Red battle callbacks are in the
-            # 0x0800xxxx range.  We check gBattleOutcome and
-            # gBattleTypeFlags for a more reliable battle detection.
             battle_outcome = self.read_bytes(FIRERED_SYMBOLS["gBattleOutcome"][0], 1)[0]
             battle_flags = self.read_u32(FIRERED_SYMBOLS["gBattleTypeFlags"][0])
 
-            # If battle type flags are non-zero and outcome is 0, we're in battle
             if battle_flags != 0 and battle_outcome == 0:
                 return GameState.BATTLE
             if battle_outcome != 0:
                 return GameState.BATTLE_ENDING
 
-            # Check if play-time counter is running (game has started)
+            # play-time counter: 0 = title/intro, 1 = in-game
             play_state = self.read_bytes(FIRERED_SYMBOLS["sPlayTimeCounterState"][0], 1)[0]
             if play_state == 0:
                 return GameState.TITLE_SCREEN
+
+            # Check gSaveBlock2 for player name (first 7 bytes at ptr+0)
+            # All 0xFF = uninitialized save → naming screen / new game intro
+            sb2_ptr = self.read_u32(FIRERED_SYMBOLS["gSaveBlock2Ptr"][0])
+            if sb2_ptr != 0:
+                name_bytes = self.read_bytes(sb2_ptr, 7)
+                if all(b == 0xFF for b in name_bytes):
+                    return GameState.NAMING_SCREEN
+                # All zero also means unset
+                if all(b == 0x00 for b in name_bytes):
+                    return GameState.NAMING_SCREEN
+
+            # Check map bank/map from gSaveBlock1 (offset 0x4 = mapGroup, 0x5 = mapNum)
+            sb1_ptr = self.read_u32(FIRERED_SYMBOLS["gSaveBlock1Ptr"][0])
+            if sb1_ptr != 0:
+                map_group = self.read_bytes(sb1_ptr + 0x4, 1)[0]
+                map_num = self.read_bytes(sb1_ptr + 0x5, 1)[0]
+                # Pallet Town = bank 0, map 0 — player spawns here after intro
+                # Oak's lab = bank 0, map 1
+                if map_group == 0 and map_num in (0, 1):
+                    return GameState.CHOOSE_STARTER
 
             return GameState.OVERWORLD
         except Exception:
