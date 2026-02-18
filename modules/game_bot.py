@@ -98,25 +98,103 @@ class GameState(IntEnum):
     UNKNOWN = auto()
 
 
-# ── Symbol tables (Fire Red USA v1.0) ────────────────────────────────────────
-# Sourced from pokefirered decompilation, same as pokebot-gen3.
+# ── Symbol table loader (matches pokebot-gen3 modules/game.py) ───────────────
 
-FIRERED_SYMBOLS: Dict[str, Tuple[int, int]] = {
-    # symbol_name: (address, size_bytes)
-    "gMain": (0x030022C0, 0x438),
-    "gSaveBlock1Ptr": (0x03005008, 4),
-    "gSaveBlock2Ptr": (0x0300500C, 4),
-    "gPlayerParty": (0x02024284, 600),
-    "gPlayerPartyCount": (0x02024280, 4),
-    "gEnemyParty": (0x0202402C, 600),
-    "gBattleOutcome": (0x02023E8A, 1),
-    "gBattleTypeFlags": (0x02022B4C, 4),
-    "sPlayTimeCounterState": (0x02039318, 1),
-    "gObjectEvents": (0x02036E38, 0x960),
+_SYM_DIR = ROOT_DIR / "external" / "pokebot-gen3" / "modules" / "data" / "symbols"
+
+# Maps game_code → primary .sym filename
+_SYM_FILES: Dict[str, str] = {
+    "BPR": "pokefirered.sym",      # Fire Red rev0
+    "BPR1": "pokefirered_rev1.sym", # Fire Red rev1
+    "BPG": "pokeleafgreen.sym",
+    "BPG1": "pokeleafgreen_rev1.sym",
+    "BPE": "pokeemerald.sym",
+    "AXV": "pokeruby.sym",
+    "AXP": "pokesapphire.sym",
 }
 
-# Callback pointer → GameState (used for state detection)
-_CALLBACK_STATE: Dict[int, GameState] = {}  # populated at runtime via symbol lookup
+# name.upper() → (address, size)
+_symbols: Dict[str, Tuple[int, int]] = {}
+# address → name (for reverse lookup of callback pointers)
+_reverse_symbols: Dict[int, str] = {}
+
+
+def _load_sym_file(sym_filename: str) -> None:
+    """Parse a .sym file and populate _symbols / _reverse_symbols."""
+    global _symbols, _reverse_symbols
+    _symbols.clear()
+    _reverse_symbols.clear()
+
+    for sym_dir in (_SYM_DIR, _SYM_DIR / "patches"):
+        sym_path = sym_dir / sym_filename
+        if not sym_path.exists():
+            continue
+        with open(sym_path, "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                try:
+                    addr = int(parts[0], 16)
+                    size = int(parts[2], 16)
+                    name = parts[3].strip()
+                except ValueError:
+                    continue
+                if name in (".gcc2_compiled", ".gcc2_compiled."):
+                    continue
+                _symbols[name.upper()] = (addr, size)
+                # Keep the first (lowest-address) mapping for reverse lookup
+                if addr not in _reverse_symbols:
+                    _reverse_symbols[addr] = name.upper()
+
+    logger.info("Loaded %d symbols from %s", len(_symbols), sym_filename)
+
+
+def get_symbol(name: str) -> Tuple[int, int]:
+    """Return (address, size) for a symbol name (case-insensitive)."""
+    key = name.upper()
+    if key not in _symbols:
+        raise KeyError(f"Unknown symbol: {name}")
+    return _symbols[key]
+
+
+def get_symbol_name(address: int) -> str:
+    """Reverse-lookup: return the symbol name for an address, or '' if not found."""
+    return _reverse_symbols.get(address, "")
+
+
+def get_symbol_name_before(address: int) -> str:
+    """
+    Return the nearest symbol whose address is <= the given address.
+    Matches pokebot-gen3's get_symbol_name_before() used for callback resolution.
+    """
+    # Exact match first
+    if address in _reverse_symbols:
+        return _reverse_symbols[address]
+    # Walk backwards up to 0x200 bytes
+    for delta in range(1, 0x200):
+        candidate = address - delta
+        if candidate in _reverse_symbols:
+            return _reverse_symbols[candidate]
+    return ""
+
+
+# ── Hardcoded fallback symbol table (Fire Red USA rev0) ───────────────────────
+# Used when the .sym file cannot be loaded.  Addresses verified against
+# the pokefirered decompilation and pokebot-gen3's pokefirered.sym.
+
+FIREREED_SYMBOLS: Dict[str, Tuple[int, int]] = {
+    "GMAIN":               (0x030030F0, 0x43C),   # corrected from sym file
+    "GSAVEBLOCK1PTR":      (0x03005008, 4),
+    "GSAVEBLOCK2PTR":      (0x0300500C, 4),
+    "GPLAYERPARTY":        (0x02024284, 600),
+    "GPLAYERPARTYCOUNT":   (0x02024280, 4),
+    "GENEMYPARTY":         (0x0202402C, 600),
+    "GBATTLEOUTCOME":      (0x02023E8A, 1),
+    "GBATTLETYPEFLAGS":    (0x02022B4C, 4),
+    "SPLAYTIMECOUNTERSTATE": (0x03000E7C, 1),     # corrected from sym file
+    "GOBJECTEVENTS":       (0x02036E38, 0x240),
+}
 
 
 # ── Pokemon data structures ─────────────────────────────────────────────────
@@ -257,6 +335,28 @@ class GameBot:
         inst._running = True
 
         self.instance = inst
+
+        # Load the correct symbol table from the .sym file
+        # Detect game from ROM filename (case-insensitive)
+        rom_stem = rom.stem.upper()
+        if "FIRERED" in rom_stem or "FIRE" in rom_stem:
+            sym_file = "pokefirered.sym"
+        elif "LEAFGREEN" in rom_stem or "LEAF" in rom_stem:
+            sym_file = "pokeleafgreen.sym"
+        elif "EMERALD" in rom_stem:
+            sym_file = "pokeemerald.sym"
+        elif "RUBY" in rom_stem:
+            sym_file = "pokeruby.sym"
+        elif "SAPPHIRE" in rom_stem:
+            sym_file = "pokesapphire.sym"
+        else:
+            sym_file = "pokefirered.sym"  # default
+        try:
+            _load_sym_file(sym_file)
+            logger.info("Loaded symbol table: %s (%d symbols)", sym_file, len(_symbols))
+        except Exception as exc:
+            logger.warning("Could not load sym file %s: %s – using fallback addresses", sym_file, exc)
+
         logger.info("Launched headless emulator: %s", inst)
         return inst
 
@@ -328,75 +428,122 @@ class GameBot:
     def read_u32(self, address: int) -> int:
         return struct.unpack("<I", self.read_bytes(address, 4))[0]
 
+    def _sym(self, name: str) -> Tuple[int, int]:
+        """
+        Look up a symbol address+size.
+        Prefers the loaded .sym table; falls back to FIREREED_SYMBOLS.
+        """
+        key = name.upper()
+        if key in _symbols:
+            return _symbols[key]
+        if key in FIREREED_SYMBOLS:
+            return FIREREED_SYMBOLS[key]
+        raise KeyError(f"Unknown symbol: {name}")
+
     def read_symbol(self, name: str, offset: int = 0, size: int = 0) -> bytes:
-        """Read a symbol from the Fire Red symbol table."""
-        if name not in FIRERED_SYMBOLS:
-            raise KeyError(f"Unknown symbol: {name}")
-        addr, length = FIRERED_SYMBOLS[name]
+        """Read a named symbol from GBA memory using the loaded symbol table."""
+        addr, length = self._sym(name)
         if size <= 0:
             size = length
         return self.read_bytes(addr + offset, size)
 
     def get_save_block(self, num: int = 1, offset: int = 0, size: int = 0) -> bytes:
         """Read from save block 1 or 2 (FR/LG uses pointer indirection)."""
-        ptr = self.read_u32(FIRERED_SYMBOLS[f"gSaveBlock{num}Ptr"][0])
+        ptr_addr, _ = self._sym(f"gSaveBlock{num}Ptr")
+        ptr = self.read_u32(ptr_addr)
         if ptr == 0:
             return b"\x00" * max(size, 1)
         if size <= 0:
             size = 0x4000
         return self.read_bytes(ptr + offset, size)
 
-    # ── Game state detection ─────────────────────────────────────────────
+    # ── Game state detection (matches pokebot-gen3 modules/memory.py) ────────────────
+
+    def get_game_state_symbol(self) -> str:
+        """
+        Read gMain.callback2 (gMain+4) and resolve it to a symbol name.
+        Matches pokebot-gen3's get_game_state_symbol() exactly.
+        """
+        try:
+            gmain_addr, _ = self._sym("gMain")
+            cb2_ptr = self.read_u32(gmain_addr + 4)
+            # pokebot-gen3 subtracts 1 from the pointer before lookup
+            return get_symbol_name_before(cb2_ptr - 1)
+        except Exception:
+            return ""
 
     def get_game_state(self) -> GameState:
         """
-        Determine the current game state by reading gMain and save-block data.
-
-        Detection priority:
-          1. Battle flags / outcome  → BATTLE / BATTLE_ENDING
-          2. play-time counter == 0  → TITLE_SCREEN (no save loaded yet)
-          3. gSaveBlock2 player name all-zero → NAMING_SCREEN (new game, name entry)
-          4. gSaveBlock1 map bank/map == 0 and save block valid → CHOOSE_STARTER
-          5. Otherwise              → OVERWORLD
+        Determine the current game state by resolving gMain.callback2 to a
+        symbol name and matching it — identical to pokebot-gen3's get_game_state().
         """
         try:
-            battle_outcome = self.read_bytes(FIRERED_SYMBOLS["gBattleOutcome"][0], 1)[0]
-            battle_flags = self.read_u32(FIRERED_SYMBOLS["gBattleTypeFlags"][0])
+            cb = self.get_game_state_symbol()
+            logger.debug("get_game_state: callback2=%s", cb)
 
-            if battle_flags != 0 and battle_outcome == 0:
-                return GameState.BATTLE
-            if battle_outcome != 0:
-                return GameState.BATTLE_ENDING
-
-            # play-time counter: 0 = title/intro, 1 = in-game
-            play_state = self.read_bytes(FIRERED_SYMBOLS["sPlayTimeCounterState"][0], 1)[0]
-            if play_state == 0:
-                return GameState.TITLE_SCREEN
-
-            # Check gSaveBlock2 for player name (first 7 bytes at ptr+0)
-            # All 0xFF = uninitialized save → naming screen / new game intro
-            sb2_ptr = self.read_u32(FIRERED_SYMBOLS["gSaveBlock2Ptr"][0])
-            if sb2_ptr != 0:
-                name_bytes = self.read_bytes(sb2_ptr, 7)
-                if all(b == 0xFF for b in name_bytes):
-                    return GameState.NAMING_SCREEN
-                # All zero also means unset
-                if all(b == 0x00 for b in name_bytes):
-                    return GameState.NAMING_SCREEN
-
-            # Check map bank/map from gSaveBlock1 (offset 0x4 = mapGroup, 0x5 = mapNum)
-            sb1_ptr = self.read_u32(FIRERED_SYMBOLS["gSaveBlock1Ptr"][0])
-            if sb1_ptr != 0:
-                map_group = self.read_bytes(sb1_ptr + 0x4, 1)[0]
-                map_num = self.read_bytes(sb1_ptr + 0x5, 1)[0]
-                # Pallet Town = bank 0, map 0 — player spawns here after intro
-                # Oak's lab = bank 0, map 1
-                if map_group == 0 and map_num in (0, 1):
+            match cb:
+                case "CB2_OVERWORLD":
+                    return GameState.OVERWORLD
+                case "BATTLEMAINCB2":
+                    return GameState.BATTLE
+                case "CB2_BAGMENURUN":
+                    return GameState.BAG_MENU
+                case "CB2_UPDATEPARTYMENU" | "CB2_PARTYMENUMAIN":
+                    return GameState.PARTY_MENU
+                case "CB2_INITBATTLE" | "CB2_HANDLESTARTBATTLE" | "CB2_OVERWORLDBASIC":
+                    return GameState.BATTLE_STARTING
+                case "CB2_ENDWILDBATTLE":
+                    return GameState.BATTLE_ENDING
+                case "CB2_LOADMAP" | "CB2_LOADMAP2" | "CB2_DOCHANGEMAP":
+                    return GameState.CHANGE_MAP
+                case "CB2_STARTERCHOOSE" | "CB2_CHOOSESTARTER":
                     return GameState.CHOOSE_STARTER
-
-            return GameState.OVERWORLD
-        except Exception:
+                case (
+                    "CB2_INITCOPYRIGHTSCREENAFTERBOOTUP"
+                    | "CB2_WAITFADEBEFORESETUPINTRO"
+                    | "CB2_SETUPINTRO"
+                    | "CB2_INTRO"
+                    | "CB2_INITTITLESCREEN"
+                    | "CB2_TITLESCREENRUN"
+                    | "CB2_INITCOPYRIGHTSCREENAFTERTITLESCREEN"
+                    | "CB2_INITMAINMENU"
+                    | "MAINCB2"
+                    | "MAINCB2_INTRO"
+                ):
+                    return GameState.TITLE_SCREEN
+                case "CB2_MAINMENU":
+                    return GameState.MAIN_MENU
+                case "CB2_EVOLUTIONSCENEUPDATE":
+                    return GameState.EVOLUTION
+                case "CB2_EGGHATCH" | "CB2_LOADEGGHATCH" | "CB2_EGGHATCH_0" | "CB2_EGGHATCH_1":
+                    return GameState.EGG_HATCH
+                case "CB2_WHITEOUT":
+                    return GameState.WHITEOUT
+                case "CB2_LOADNAMINGSCREEN" | "CB2_NAMINGSCREEN":
+                    return GameState.NAMING_SCREEN
+                case "CB2_POKESTORAGE":
+                    return GameState.POKE_STORAGE
+                case _:
+                    return GameState.UNKNOWN
+        except Exception as exc:
+            logger.debug("get_game_state exception: %s", exc)
             return GameState.UNKNOWN
+
+    def game_has_started(self) -> bool:
+        """
+        Reports whether the game has progressed past the main menu.
+        Matches pokebot-gen3's game_has_started() exactly:
+          sPlayTimeCounterState != 0  AND  gObjectEvents[0x10:0x19] != 0
+        """
+        try:
+            pts_addr, _ = self._sym("sPlayTimeCounterState")
+            if self.read_bytes(pts_addr, 1)[0] == 0:
+                return False
+            obj_addr, _ = self._sym("gObjectEvents")
+            obj_data = self.read_bytes(obj_addr + 0x10, 9)
+            return int.from_bytes(obj_data, "little") != 0
+        except Exception:
+            return False
 
     def is_in_battle(self) -> bool:
         state = self.get_game_state()
