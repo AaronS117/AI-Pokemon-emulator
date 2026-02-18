@@ -310,9 +310,65 @@ def set_thread_affinity(thread_index: int, cpu_count: int) -> None:
         pass
 
 
+def detect_monitors() -> list:
+    """
+    Return a list of monitor info dicts: {x, y, width, height, is_primary, dpi_scale}.
+    Uses tkinter's winfo_screenwidth/height for primary; screeninfo for multi-monitor.
+    Falls back gracefully if screeninfo is not installed.
+    """
+    monitors = []
+    try:
+        import screeninfo
+        for m in screeninfo.get_monitors():
+            monitors.append({
+                "x": m.x, "y": m.y,
+                "width": m.width, "height": m.height,
+                "is_primary": getattr(m, "is_primary", m.x == 0 and m.y == 0),
+                "name": getattr(m, "name", ""),
+            })
+    except Exception:
+        pass
+
+    if not monitors:
+        # Fallback: single monitor via ctypes on Windows
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            monitors.append({
+                "x": 0, "y": 0,
+                "width": user32.GetSystemMetrics(0),
+                "height": user32.GetSystemMetrics(1),
+                "is_primary": True, "name": "Primary",
+            })
+        except Exception:
+            monitors.append({"x": 0, "y": 0, "width": 1920, "height": 1080,
+                             "is_primary": True, "name": "Primary"})
+
+    # Sort: primary first
+    monitors.sort(key=lambda m: (not m["is_primary"], m["x"]))
+    return monitors
+
+
+def get_secondary_monitor_origin() -> tuple:
+    """
+    Return (x, y) of the top-left corner of the second monitor,
+    or None if only one monitor is detected.
+    """
+    mons = detect_monitors()
+    for m in mons:
+        if not m["is_primary"]:
+            return (m["x"], m["y"])
+    return None
+
+
 # ── Bot Modes ────────────────────────────────────────────────────────────────
 
 BOT_MODES = {
+    "manual": {
+        "label": "Manual Control",
+        "desc": "Take full keyboard control of the emulator. No automation.",
+        "status": "Ready",
+    },
     "encounter_farm": {
         "label": "Wild Encounter Farm",
         "desc": "Walk in grass to trigger random encounters.",
@@ -390,6 +446,7 @@ class InstanceState:
     error: str = ""
     cpu_core: int = -1
     manual_control: bool = False  # True = user has taken over, bot pauses
+    save_path: str = ""          # path of the .sav file loaded for this instance
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _pause_event: threading.Event = field(default_factory=threading.Event)
     _input_queue: "queue.Queue" = field(default_factory=lambda: __import__('queue').Queue())
@@ -627,8 +684,11 @@ def emulator_worker(
             seed=state.seed, tid=state.tid, sid=state.sid,
             rom_path=_rom_p, instance_id=iid, speed=speed,
         )
-        wlog.info("Instance %d  Emulator launched (headless mGBA)  save=emulator/saves/%d/%s.sav  speed=%s",
-                  iid, iid, _rom_p.stem, f"{speed}x" if speed > 0 else "max")
+        # Store the actual save path so the UI can display it
+        if bot.instance and bot.instance.save_path:
+            state.save_path = str(bot.instance.save_path)
+        wlog.info("Instance %d  Emulator launched  save=%s  speed=%s",
+                  iid, state.save_path or "none", f"{speed}x" if speed > 0 else "max")
 
         # ── Boot sequence ─────────────────────────────────────────────────
         if not _has_save:
@@ -1699,168 +1759,6 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
-    def _create_card(self, inst_id: int, state: InstanceState):
-        """Open a dedicated Toplevel window for this emulator instance."""
-        self._create_inst_row(inst_id, state)
-        # Tile windows: 4 per row, each 320px wide (instances always start at 1)
-        col = (inst_id - 1) % 4
-        row = (inst_id - 1) // 4
-        x_off = 20 + col * 340
-        y_off = 60 + row * 340
-
-        win = ctk.CTkToplevel(self)
-        win.title(f"Instance #{inst_id}  –  {BOT_MODES.get(state.bot_mode, {}).get('label', state.bot_mode)}")
-        win.geometry(f"320x330+{x_off}+{y_off}")
-        win.configure(fg_color=C["bg_dark"])
-        win.resizable(False, False)
-
-        # Closing the window stops this instance and destroys the window
-        def _on_close():
-            state.request_stop()
-            try:
-                win.after(200, win.destroy)
-            except Exception:
-                pass
-        win.protocol("WM_DELETE_WINDOW", _on_close)
-
-        # ── Title bar row ────────────────────────────────────────────────
-        title_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
-        title_row.pack(fill="x")
-
-        status_label = ctk.CTkLabel(
-            title_row, text="BOOTING", width=80,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=C["yellow"],
-        )
-        status_label.pack(side="left", padx=(8, 0), pady=6)
-
-        info_text = f"#{inst_id}  TID:{state.tid}  SID:{state.sid}"
-        info_label = ctk.CTkLabel(
-            title_row, text=info_text,
-            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
-        )
-        info_label.pack(side="left", padx=6)
-
-        btn_box = ctk.CTkFrame(title_row, fg_color="transparent")
-        btn_box.pack(side="right", padx=6)
-
-        pause_btn = ctk.CTkButton(
-            btn_box, text="Pause", width=50, height=24,
-            font=ctk.CTkFont(size=10),
-            fg_color=C["yellow"], hover_color="#ca8a04", text_color="#000",
-            command=lambda: state.request_pause(),
-        )
-        pause_btn.pack(side="left", padx=2)
-
-        stop_btn = ctk.CTkButton(
-            btn_box, text="Stop", width=50, height=24,
-            font=ctk.CTkFont(size=10),
-            fg_color=C["red"], hover_color="#dc2626", text_color="#fff",
-            command=lambda: state.request_stop(),
-        )
-        stop_btn.pack(side="left", padx=2)
-
-        # Take Control toggle button
-        ctrl_btn_ref = [None]
-
-        def _toggle_control():
-            state.manual_control = not state.manual_control
-            if state.manual_control:
-                ctrl_btn_ref[0].configure(
-                    text="Bot", fg_color=C["accent"], text_color="#fff")
-                win.focus_set()
-            else:
-                ctrl_btn_ref[0].configure(
-                    text="Control", fg_color="#1e3a5f", text_color=C["text"])
-
-        ctrl_btn = ctk.CTkButton(
-            btn_box, text="Control", width=58, height=24,
-            font=ctk.CTkFont(size=10),
-            fg_color="#1e3a5f", hover_color=C["accent"], text_color=C["text"],
-            command=_toggle_control,
-        )
-        ctrl_btn.pack(side="left", padx=(2, 0))
-        ctrl_btn_ref[0] = ctrl_btn
-        self._ctrl_btn_refs = getattr(self, "_ctrl_btn_refs", {})
-        self._ctrl_btn_refs[inst_id] = ctrl_btn_ref
-
-        # ── Live game screen (240×160 scaled 1.25x → 300×200) ───────────
-        screen_label = ctk.CTkLabel(win, text="", fg_color=C["bg_dark"])
-        screen_label.pack(pady=(4, 0))
-
-        # Placeholder while waiting for first frame
-        placeholder = ctk.CTkLabel(
-            win,
-            text="Booting game…\n\nPress A/Start to advance\nor wait for auto-boot",
-            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
-            fg_color="#111111", width=300, height=200,
-        )
-        placeholder.pack()
-        placeholder_ref = [placeholder]  # mutable ref so update can hide it
-
-        # ── Keyboard bindings (active when window is focused) ────────────
-        _keybinds = self.settings.get("keybinds", {
-            "a": "a", "s": "b", "Return": "start", "BackSpace": "select",
-            "Up": "up", "Down": "down", "Left": "left", "Right": "right",
-            "q": "l", "w": "r",
-        })
-
-        def _on_key(event):
-            if not state.manual_control:
-                return
-            key = event.keysym
-            btn = _keybinds.get(key)
-            if btn:
-                state.send_input(btn)
-
-        win.bind("<KeyPress>", _on_key)
-        # Click on screen to focus window for keyboard input
-        screen_label.bind("<Button-1>", lambda e: win.focus_set())
-
-        # ── Metrics row ──────────────────────────────────────────────────
-        metrics_row = ctk.CTkFrame(win, fg_color=C["bg_input"], corner_radius=0)
-        metrics_row.pack(fill="x", side="bottom")
-
-        enc_label = ctk.CTkLabel(
-            metrics_row, text="Enc: 0",
-            font=ctk.CTkFont(size=11), text_color=C["text"], width=90,
-        )
-        enc_label.pack(side="left", padx=(8, 0), pady=4)
-
-        fps_label = ctk.CTkLabel(
-            metrics_row, text="FPS: 0",
-            font=ctk.CTkFont(size=11), text_color=C["text"], width=90,
-        )
-        fps_label.pack(side="left")
-
-        frame_label = ctk.CTkLabel(
-            metrics_row, text="Frames: 0",
-            font=ctk.CTkFont(size=11), text_color=C["text_dim"], width=110,
-        )
-        frame_label.pack(side="left")
-
-        progress = ctk.CTkProgressBar(
-            metrics_row, width=60, height=6,
-            fg_color=C["border"], progress_color=C["accent"],
-        )
-        progress.pack(side="right", padx=8)
-        progress.set(0)
-
-        self._instance_widgets[inst_id] = {
-            "win": win,
-            "status": status_label,
-            "info": info_label,
-            "screen": screen_label,
-            "placeholder": placeholder_ref,
-            "enc": enc_label,
-            "fps": fps_label,
-            "frames": frame_label,
-            "ctrl_btn_ref": ctrl_btn_ref,
-            "progress": progress,
-            "pause": pause_btn,
-            "stop": stop_btn,
-        }
-
     def _update_card(self, inst_id: int, state: InstanceState):
         w = self._instance_widgets.get(inst_id)
         if not w:
@@ -1932,31 +1830,61 @@ class App(ctk.CTk):
             w["pause"].configure(state="disabled")
             w["stop"].configure(state="disabled")
 
-        # Sync Control button appearance to actual manual_control state
-        # (worker may auto-set it without the button being clicked)
-        ctrl_ref = w.get("ctrl_btn_ref")
-        if ctrl_ref and ctrl_ref[0] is not None:
+        # Sync Manual/Bot button pair to actual manual_control state
+        ctrl_pair = w.get("ctrl_pair")
+        if ctrl_pair:
             try:
                 if state.manual_control:
-                    ctrl_ref[0].configure(
-                        text="▶ Bot", fg_color=C["accent"], text_color="#fff")
+                    ctrl_pair["manual"].configure(
+                        fg_color=C["accent"], text_color="#fff",
+                        border_color=C["accent"])
+                    ctrl_pair["bot"].configure(
+                        fg_color=C["bg_dark"], text_color=C["text_dim"],
+                        border_color=C["border"])
                 else:
-                    ctrl_ref[0].configure(
-                        text="Control", fg_color="#1e3a5f", text_color=C["text"])  
+                    ctrl_pair["bot"].configure(
+                        fg_color=C["accent"], text_color="#fff",
+                        border_color=C["accent"])
+                    ctrl_pair["manual"].configure(
+                        fg_color=C["bg_dark"], text_color=C["text_dim"],
+                        border_color=C["border"])
+            except Exception:
+                pass
+
+        # Update save path label once it's known
+        save_lbl = w.get("save_label")
+        if save_lbl and state.save_path:
+            try:
+                sav_name = Path(state.save_path).name
+                sav_dir = Path(state.save_path).parent.name
+                save_lbl.configure(
+                    text=f"💾  saves/{sav_dir}/{sav_name}",
+                    text_color="#5aba5a" if Path(state.save_path).stat().st_size > 0 else "#aa6a00"
+                )
             except Exception:
                 pass
 
         # Live screen: update from screenshot captured by worker
         if state.last_screenshot is not None:
             try:
-                # Hide placeholder on first real frame
                 ph_ref = w.get("placeholder")
                 if ph_ref and ph_ref[0] is not None:
                     ph_ref[0].pack_forget()
                     ph_ref[0] = None
 
-                # Scale 240×160 → 300×200 (1.25x) for visibility
-                img = state.last_screenshot.resize((300, 200), Image.NEAREST)
+                # Scale to current window width (resizable)
+                try:
+                    win_w = w["win"].winfo_width()
+                    win_h = w["win"].winfo_height()
+                except Exception:
+                    win_w, win_h = 320, 330
+                # Leave room for title/ctrl/save/metrics rows (~120px)
+                avail_w = max(240, win_w - 4)
+                avail_h = max(160, win_h - 120)
+                scale = min(avail_w / 240, avail_h / 160)
+                img_w = int(240 * scale)
+                img_h = int(160 * scale)
+                img = state.last_screenshot.resize((img_w, img_h), Image.NEAREST)
                 photo = ImageTk.PhotoImage(img)
                 self._photo_cache[inst_id] = photo
                 w["screen"].configure(image=photo, text="")
@@ -1987,7 +1915,10 @@ class App(ctk.CTk):
 
         win = ctk.CTkToplevel(self)
         win.title("Live Log – Gen 3 Shiny Hunter")
-        win.geometry("900x560+60+60")
+        # Place on second monitor if available, otherwise top-left of primary
+        _sec = get_secondary_monitor_origin()
+        _lx, _ly = (_sec[0] + 20, _sec[1] + 20) if _sec else (60, 60)
+        win.geometry(f"900x560+{_lx}+{_ly}")
         win.configure(fg_color=C["bg_dark"])
         self._log_win = win
 
@@ -2138,7 +2069,10 @@ class App(ctk.CTk):
         """Show shiny/perfect IV math for all running instances."""
         win = ctk.CTkToplevel(self)
         win.title("Shiny & Perfect IV Math")
-        win.geometry("720x580")
+        # Place on second monitor if available (offset from log window)
+        _sec = get_secondary_monitor_origin()
+        _mx, _my = (_sec[0] + 940, _sec[1] + 20) if _sec else (800, 60)
+        win.geometry(f"720x580+{_mx}+{_my}")
         win.configure(fg_color=C["bg_dark"])
         win.resizable(True, True)
 
@@ -2545,6 +2479,135 @@ class App(ctk.CTk):
         self._rom_status.configure(text=f"{p.name} ({size_mb:.1f} MB)", text_color=C["green"])
         return True
 
+    def _show_save_dialog(self, count: int, rom_p: Path) -> Optional[dict]:
+        """
+        Show a dialog letting the user choose a save file (or new game) for
+        each instance about to be created.
+
+        Returns a dict {inst_num: "existing"|"new"} or None if cancelled.
+        """
+        import tkinter as tk
+        from tkinter import filedialog
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Save File Setup")
+        dlg.configure(fg_color=C["bg_dark"])
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        # Centre on primary monitor
+        monitors = detect_monitors()
+        pm = monitors[0]
+        dlg_w, dlg_h = 520, min(80 + count * 90, 600)
+        dlg.geometry(f"{dlg_w}x{dlg_h}+{pm['x'] + (pm['width'] - dlg_w)//2}+{pm['y'] + (pm['height'] - dlg_h)//2}")
+
+        ctk.CTkLabel(
+            dlg, text="Configure Save Files",
+            font=ctk.CTkFont(size=15, weight="bold"), text_color=C["text"],
+        ).pack(pady=(14, 4))
+        ctk.CTkLabel(
+            dlg,
+            text=f"Expected location:  emulator/saves/<N>/{rom_p.stem}.sav",
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+        ).pack(pady=(0, 8))
+
+        scroll = ctk.CTkScrollableFrame(dlg, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        choices: dict[int, ctk.StringVar] = {}
+
+        for n in range(1, count + 1):
+            sav = SAVE_DIR / str(n) / f"{rom_p.stem}.sav"
+            exists = sav.exists() and sav.stat().st_size > 0
+            size_kb = round(sav.stat().st_size / 1024, 1) if sav.exists() else 0
+
+            row = ctk.CTkFrame(scroll, fg_color=C["bg_input"], corner_radius=6)
+            row.pack(fill="x", pady=4)
+
+            ctk.CTkLabel(
+                row, text=f"Instance #{n}",
+                font=ctk.CTkFont(size=12, weight="bold"), text_color=C["text"],
+                width=90,
+            ).grid(row=0, column=0, padx=(10, 4), pady=6, sticky="w")
+
+            if exists:
+                sav_info = f"✅  saves/{n}/{rom_p.stem}.sav  ({size_kb} KB)"
+                sav_color = "#5aba5a"
+            else:
+                sav_info = f"⚠️  No save found at saves/{n}/{rom_p.stem}.sav"
+                sav_color = "#aa6a00"
+
+            ctk.CTkLabel(
+                row, text=sav_info,
+                font=ctk.CTkFont(size=10), text_color=sav_color,
+            ).grid(row=0, column=1, padx=4, sticky="w")
+
+            var = ctk.StringVar(value="existing" if exists else "new")
+            choices[n] = var
+
+            opt_frame = ctk.CTkFrame(row, fg_color="transparent")
+            opt_frame.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+
+            ctk.CTkRadioButton(
+                opt_frame, text="Load existing save", variable=var, value="existing",
+                font=ctk.CTkFont(size=11), text_color=C["text"],
+                fg_color=C["accent"], state="normal" if exists else "disabled",
+            ).pack(side="left", padx=(0, 12))
+
+            ctk.CTkRadioButton(
+                opt_frame, text="New game (manual/intro)", variable=var, value="new",
+                font=ctk.CTkFont(size=11), text_color=C["text"],
+                fg_color=C["accent"],
+            ).pack(side="left", padx=(0, 12))
+
+            def _browse(n=n, var=var):
+                path = filedialog.askopenfilename(
+                    title=f"Select save for Instance #{n}",
+                    filetypes=[("GBA Save", "*.sav"), ("All files", "*.*")],
+                )
+                if path:
+                    dest = SAVE_DIR / str(n) / f"{rom_p.stem}.sav"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    import shutil as _sh
+                    _sh.copy2(path, dest)
+                    var.set("existing")
+                    logger.info("Instance %d: copied save from %s → %s", n, path, dest)
+
+            ctk.CTkButton(
+                opt_frame, text="Browse…", width=80, height=24,
+                font=ctk.CTkFont(size=10),
+                fg_color=C["bg_dark"], hover_color=C["accent"],
+                border_width=1, border_color=C["border"],
+                command=_browse,
+            ).pack(side="left")
+
+        result: list = [None]
+
+        def _ok():
+            result[0] = {n: v.get() for n, v in choices.items()}
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.pack(fill="x", padx=14, pady=(0, 14))
+        ctk.CTkButton(
+            btn_row, text="Start", height=36,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=C["green"], hover_color="#16a34a", text_color="#000",
+            command=_ok,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(
+            btn_row, text="Cancel", height=36,
+            font=ctk.CTkFont(size=13),
+            fg_color=C["red"], hover_color="#dc2626", text_color="#fff",
+            command=_cancel,
+        ).pack(side="right", fill="x", expand=True, padx=(6, 0))
+
+        self.wait_window(dlg)
+        return result[0]
+
     def _start_all(self):
         if not self._validate_rom_display():
             from tkinter import messagebox
@@ -2558,29 +2621,12 @@ class App(ctk.CTk):
         game_version = self._game_version_var.get()
         _rom_p = Path(rom_path)
 
-        # ── Check save files for all instances-to-be-created ─────────────
-        _any_save = any(
-            save_exists_for_instance(inst_num, _rom_p)
-            for inst_num in range(1, count + 1)
-        )
+        mode = self._mode_var.get() or "manual"
 
-        mode = self._mode_var.get()
-        if not mode:
-            if _any_save:
-                # Has saves but no mode selected – ask user to pick one
-                from tkinter import messagebox
-                messagebox.showerror(
-                    "Bot Mode Required",
-                    "A save file was found.\nPlease select a Bot Mode before starting."
-                )
-                return
-            else:
-                # No saves at all – auto-start in manual mode, no bot mode needed
-                mode = "manual"
-                logger.info(
-                    "No save files found for %d instance(s) – auto-starting in MANUAL mode. "
-                    "Bot will attempt new-game intro sequence, then hand control to you.", count
-                )
+        # ── Save selection dialog ─────────────────────────────────────────
+        save_choices = self._show_save_dialog(count, _rom_p)
+        if save_choices is None:
+            return  # user cancelled
 
         # ── Stop and clean up any previous run ───────────────────────────
         for s in self.instances.values():
@@ -2593,7 +2639,7 @@ class App(ctk.CTk):
         self._instance_widgets.clear()
         self.instances.clear()
         self.threads.clear()
-        self._next_id = 1  # always start from instance 1
+        self._next_id = 1
         self._photo_cache.clear()
         for r in getattr(self, "_inst_rows", {}).values():
             try:
@@ -2610,33 +2656,30 @@ class App(ctk.CTk):
         })
         save_settings(self.settings)
 
-        if not _any_save:
-            self._placeholder.configure(
-                text=f"{count} instance(s) starting in MANUAL mode (no save file found).\n\n"
-                     "Bot will try to navigate the new-game intro automatically.\n"
-                     "If it gets stuck, use the Control button to take over.\n\n"
-                     f"Save path expected:  emulator/saves/<1-{count}>/{_rom_p.stem}.sav"
-            )
-        else:
-            self._placeholder.configure(
-                text=f"{count} instance window(s) opening…\n\n"
-                     "Each instance runs in its own window.\n"
-                     "Use the Control button in each window to take manual control."
-            )
+        self._placeholder.configure(
+            text=f"{count} instance window(s) opening…\n\n"
+                 "Each instance runs in its own window.\n"
+                 "Use Manual/Bot buttons to switch control mode."
+        )
         self._placeholder.pack(pady=40)
         self._start_time = time.time()
 
         for i in range(count):
+            iid = self._next_id
             seed = (0x1234 + i * 0x111) & 0xFFFF
             trainer_id = seed_to_ids(seed)
             inst_mode = mode
+            # If user chose "new game" for this instance, force manual mode
+            _choice = save_choices.get(iid, "existing")
+            if _choice == "new":
+                inst_mode = "manual"
 
             state = InstanceState(
-                instance_id=self._next_id,
+                instance_id=iid,
                 seed=seed, tid=trainer_id.tid, sid=trainer_id.sid,
                 speed_multiplier=speed, bot_mode=inst_mode,
+                manual_control=(inst_mode == "manual"),
             )
-            iid = self._next_id
             self._next_id += 1
 
             self.instances[iid] = state
