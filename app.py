@@ -130,7 +130,7 @@ DEFAULT_SETTINGS = {
     "target_area": "route1",
     "video_enabled": False,
     "bot_mode": "encounter_farm",
-    "window_geometry": "1360x820",
+    "window_geometry": "",
 }
 
 
@@ -980,7 +980,18 @@ class App(ctk.CTk):
         self.cheat_mgr = CheatManager()
 
         self.title("Gen 3 Shiny Hunter – Living Dex Edition")
-        self.geometry(self.settings.get("window_geometry", "1440x900"))
+        # Restore saved geometry, or size to 80% of primary monitor on first run
+        _saved_geom = self.settings.get("window_geometry", "")
+        if _saved_geom:
+            self.geometry(_saved_geom)
+        else:
+            _mons = detect_monitors()
+            _pm = _mons[0]
+            _w = max(1024, min(1440, int(_pm["width"] * 0.80)))
+            _h = max(640, min(900, int(_pm["height"] * 0.85)))
+            _x = _pm["x"] + (_pm["width"] - _w) // 2
+            _y = _pm["y"] + (_pm["height"] - _h) // 2
+            self.geometry(f"{_w}x{_h}+{_x}+{_y}")
         self.minsize(1024, 640)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
