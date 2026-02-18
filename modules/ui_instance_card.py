@@ -285,14 +285,41 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
         "q": "l", "w": "r",
     })
 
-    def _on_key(event):
+    # D-pad buttons use hold/release model (continuous movement).
+    # Action buttons use tap model (momentary press).
+    _HELD_BTNS = {"up", "down", "left", "right"}
+    _currently_held: set = set()  # debounce OS auto-repeat
+
+    def _on_key_press(event):
         if not state.manual_control:
             return
         btn = _keybinds.get(event.keysym)
-        if btn:
-            state.send_input(btn)
+        if not btn:
+            return
+        if btn in _HELD_BTNS:
+            if btn not in _currently_held:  # ignore OS auto-repeat
+                _currently_held.add(btn)
+                state.send_input(f"key_down:{btn}")
+        else:
+            state.send_input(btn)  # tap: A/B/Start/Select/L/R
 
-    win.bind("<KeyPress>", _on_key)
+    def _on_key_release(event):
+        if not state.manual_control:
+            return
+        btn = _keybinds.get(event.keysym)
+        if btn and btn in _HELD_BTNS and btn in _currently_held:
+            _currently_held.discard(btn)
+            state.send_input(f"key_up:{btn}")
+
+    def _on_focus_out(event):
+        """Release all held keys when window loses focus."""
+        for btn in list(_currently_held):
+            state.send_input(f"key_up:{btn}")
+        _currently_held.clear()
+
+    win.bind("<KeyPress>", _on_key_press)
+    win.bind("<KeyRelease>", _on_key_release)
+    win.bind("<FocusOut>", _on_focus_out)
     # Clicking the overlay activates manual mode
     input_overlay.bind("<Button-1>", lambda e: _set_manual(True))
     screen_label.bind("<Button-1>", lambda e: win.focus_set() if state.manual_control else None)

@@ -784,37 +784,59 @@ def emulator_worker(
                 _flog("info", "Instance %d  Switched to mode: %s", iid, _active_mode_key)
 
             # ── Manual / paused idle loop ────────────────────────────────────
+            # D-pad buttons that are currently held down (continuous movement)
+            _held_dpad: set = set()
+
             while (state.is_paused or state.manual_control) and not state.should_stop:
                 if state.manual_control:
                     bot._render_every = 1  # manual: capture every frame for live preview
                     state.status = "manual"
-                    _btn_pressed_this_tick = []
+                    _tapped_this_tick = []   # tap buttons pressed this tick (for log)
+                    _held_log = []           # hold/release events this tick (for log)
+
+                    # Drain all queued input events
                     while True:
                         try:
-                            btn_name = state._input_queue.get_nowait()
-                            gbtn = _btn_map.get(btn_name.lower())
-                            if gbtn is not None:
-                                _btn_pressed_this_tick.append(btn_name)
-                                bot.press_button(gbtn, hold_frames=4)
+                            msg = state._input_queue.get_nowait()
                         except _queue.Empty:
                             break
-                    if _btn_pressed_this_tick:
-                        # Compress repeated buttons: a,a,a,a → a×4
-                        _btn_parts = []
-                        _prev_b, _run = _btn_pressed_this_tick[0], 1
-                        for _b in _btn_pressed_this_tick[1:]:
-                            if _b == _prev_b:
-                                _run += 1
-                            else:
-                                _btn_parts.append(_prev_b if _run == 1 else f"{_prev_b}\xd7{_run}")
-                                _prev_b, _run = _b, 1
-                        _btn_parts.append(_prev_b if _run == 1 else f"{_prev_b}\xd7{_run}")
+
+                        if msg.startswith("key_down:"):
+                            # D-pad key pressed – start holding it
+                            btn = msg[9:]  # strip "key_down:"
+                            gbtn = _btn_map.get(btn)
+                            if gbtn is not None and btn not in _held_dpad:
+                                _held_dpad.add(btn)
+                                bot.hold_button(gbtn)
+                                _held_log.append(f"+{btn}")
+
+                        elif msg.startswith("key_up:"):
+                            # D-pad key released – stop holding it
+                            btn = msg[7:]  # strip "key_up:"
+                            gbtn = _btn_map.get(btn)
+                            if gbtn is not None and btn in _held_dpad:
+                                _held_dpad.discard(btn)
+                                bot.release_button(gbtn)
+                                _held_log.append(f"-{btn}")
+
+                        else:
+                            # Tap button (A/B/Start/Select/L/R)
+                            gbtn = _btn_map.get(msg.lower())
+                            if gbtn is not None:
+                                _tapped_this_tick.append(msg)
+                                bot.press_button(gbtn, hold_frames=4)
+
+                    # Log any events this tick
+                    if _held_log or _tapped_this_tick:
+                        _parts = _held_log + ([f"tap:{'+'.join(_tapped_this_tick)}"] if _tapped_this_tick else [])
                         _flog("info",
-                              "Instance %d  [MANUAL] btn=%s  overrun=%.2fms",
+                              "Instance %d  [MANUAL] %s  held=%s  overrun=%.2fms",
                               iid,
-                              "+".join(_btn_parts),
+                              " ".join(_parts),
+                              "{"+",".join(sorted(_held_dpad))+"}",
                               bot._sleep_overrun_ms)
-                    # advance_frames(1) already throttles via _frame_budget
+
+                    # Advance one frame – held_inputs bitmask stays set across frames
                     bot.advance_frames(1)
                     state.frame_count = bot.frame_count
                     state.fps = bot.real_fps
@@ -824,6 +846,13 @@ def emulator_worker(
                 else:
                     state.status = "paused"
                     time.sleep(0.05)
+
+            # Exiting manual mode – release all held d-pad keys
+            for _btn in list(_held_dpad):
+                gbtn = _btn_map.get(_btn)
+                if gbtn is not None:
+                    bot.release_button(gbtn)
+            _held_dpad.clear()
 
             if state.should_stop:
                 break
