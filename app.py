@@ -688,6 +688,9 @@ def emulator_worker(
         fps_timer = time.time()
         fps_frame_start = bot.frame_count
 
+        # In manual/watch mode render every frame so the preview is live
+        bot.set_video_enabled(True)
+
         _btn_map = {
             "a": GBAButton.A, "b": GBAButton.B,
             "start": GBAButton.START, "select": GBAButton.SELECT,
@@ -695,6 +698,8 @@ def emulator_worker(
             "left": GBAButton.LEFT, "right": GBAButton.RIGHT,
             "l": GBAButton.L, "r": GBAButton.R,
         }
+
+        import queue as _queue
 
         # Main loop
         while not state.should_stop:
@@ -704,13 +709,15 @@ def emulator_worker(
                 _active_mode_key = state.bot_mode
                 mode = _create_mode(_active_mode_key, bot)
                 mode.start()
+                # Disable full video for bot modes (periodic render is enough)
+                bot.set_video_enabled(False)
                 wlog.info("Instance %d  Switched to mode: %s", iid, _active_mode_key)
 
             # ── Manual / paused idle loop ────────────────────────────────────
             while (state.is_paused or state.manual_control) and not state.should_stop:
                 if state.manual_control:
+                    bot.set_video_enabled(True)
                     state.status = "manual"
-                    import queue as _queue
                     while True:
                         try:
                             btn_name = state._input_queue.get_nowait()
@@ -719,10 +726,12 @@ def emulator_worker(
                                 bot.press_button(gbtn, hold_frames=4)
                         except _queue.Empty:
                             break
+                    # advance_frames(1) already throttles via _frame_budget
                     bot.advance_frames(1)
                     state.frame_count = bot.frame_count
-                    _worker_capture_screen(bot, state)
-                    time.sleep(0.016)
+                    sc = bot.get_screenshot()
+                    if sc:
+                        state.last_screenshot = sc
                 else:
                     state.status = "paused"
                     time.sleep(0.05)
@@ -736,15 +745,24 @@ def emulator_worker(
                 _active_mode_key = state.bot_mode
                 mode = _create_mode(_active_mode_key, bot)
                 mode.start()
+                bot.set_video_enabled(False)
                 wlog.info("Instance %d  Resumed with mode: %s", iid, _active_mode_key)
 
-            # ── Watch mode: game runs, screen updates, no bot/inputs ────────
+            # ── Watch mode: game runs at 1x, full video, no bot inputs ───────
             if _active_mode_key == "manual":
+                bot.set_video_enabled(True)
                 bot.advance_frames(1)
                 state.frame_count = bot.frame_count
-                if state.frame_count % 4 == 0:
-                    _worker_capture_screen(bot, state)
-                time.sleep(0.016)
+                sc = bot.get_screenshot()
+                if sc:
+                    state.last_screenshot = sc
+                # FPS update (runs every second)
+                now = time.time()
+                if now - fps_timer >= 1.0:
+                    state.fps = (bot.frame_count - fps_frame_start) / (now - fps_timer)
+                    fps_timer = now
+                    fps_frame_start = bot.frame_count
+                # No extra sleep – advance_frames(1) already throttles at 1x
                 continue
 
             state.status = "running"

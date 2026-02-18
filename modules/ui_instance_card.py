@@ -458,7 +458,8 @@ def _update_card_inner(app: "App", inst_id: int, state: "InstanceState", w: dict
             scale = min(avail_w / 240, avail_h / 160)
             img = state.last_screenshot.resize(
                 (int(240 * scale), int(160 * scale)), Image.NEAREST)
-            photo = ImageTk.PhotoImage(img)
+            photo = ctk.CTkImage(light_image=img, dark_image=img,
+                                 size=(int(240 * scale), int(160 * scale)))
             app._photo_cache[inst_id] = photo
             w["screen"].configure(image=photo, text="")
         except Exception:

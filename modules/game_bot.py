@@ -273,6 +273,9 @@ class GameBot:
         self._speed: int = 0
         self._frame_budget: float = 0.0  # seconds per frame; 0 = unthrottled
         self._last_frame_time: float = 0.0
+        self._video_enabled: bool = False  # rendering layers on/off
+        self._render_every: int = 30       # render 1 frame every N frames for preview
+        self._frames_since_render: int = 0
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -331,16 +334,9 @@ class GameBot:
         # Reset the core to start emulation
         core.reset()
 
-        # Disable video rendering for maximum speed
-        # (same technique as pokebot-gen3 LibmgbaEmulator.set_video_enabled)
-        core._native.video.renderer.disableBG[0] = True
-        core._native.video.renderer.disableBG[1] = True
-        core._native.video.renderer.disableBG[2] = True
-        core._native.video.renderer.disableBG[3] = True
-        core._native.video.renderer.disableOBJ = True
-        core._native.video.renderer.disableWIN[0] = True
-        core._native.video.renderer.disableWIN[1] = True
-        core._native.video.renderer.disableOBJWIN = True
+        # Start with rendering disabled for speed; enable per-frame as needed
+        self._video_enabled = False
+        self._set_renderer(core._native, False)
 
         inst._core = core
         inst._native = core._native
@@ -377,6 +373,23 @@ class GameBot:
                     inst, f"{speed}x" if speed > 0 else "max", inst.save_path)
         return inst
 
+    @staticmethod
+    def _set_renderer(native, enabled: bool) -> None:
+        """Enable or disable all GBA rendering layers on a native core."""
+        disable = not enabled
+        for i in range(4):
+            native.video.renderer.disableBG[i] = disable
+        native.video.renderer.disableOBJ    = disable
+        native.video.renderer.disableWIN[0] = disable
+        native.video.renderer.disableWIN[1] = disable
+        native.video.renderer.disableOBJWIN = disable
+
+    def set_video_enabled(self, enabled: bool) -> None:
+        """Permanently enable/disable video rendering (e.g. for manual/watch mode)."""
+        self._video_enabled = enabled
+        if self.instance and self.instance._native:
+            self._set_renderer(self.instance._native, enabled)
+
     def set_speed(self, speed: int) -> None:
         """
         Set emulation speed for headless (no-audio) mode.
@@ -387,12 +400,16 @@ class GameBot:
         libmgba-py's GBA object has no set_sync/set_throttle method –
         throttling is done by sleeping between run_frame() calls.
         """
+        import time as _time
         self._speed = speed
         # _frame_budget: seconds per frame budget (0 = no sleep)
         if speed > 0:
             self._frame_budget = 1.0 / (60.0 * speed)
         else:
             self._frame_budget = 0.0
+        # Initialise the timer NOW so the very first frame doesn't see
+        # elapsed = (now - 0.0) = huge and skip the sleep entirely.
+        self._last_frame_time = _time.perf_counter()
 
     def destroy(self) -> None:
         """Shut down the current emulator instance."""
@@ -594,11 +611,39 @@ class GameBot:
     def _apply_inputs_and_run_frame(self) -> None:
         """Set current inputs on the core and advance one frame.
         Applies sleep-based throttle when _frame_budget > 0 (speed=1x etc.).
+        Periodically enables rendering for one frame to keep the preview live.
         """
         import time as _time
-        core = self.instance._core
+        core   = self.instance._core
+        native = self.instance._native
+
+        # Decide whether to render this frame
+        self._frames_since_render += 1
+        render_this_frame = self._video_enabled or (
+            self._frames_since_render >= self._render_every
+        )
+        if render_this_frame and not self._video_enabled:
+            self._set_renderer(native, True)
+
         core._core.setKeys(core._core, self._pressed_inputs | self._held_inputs)
         core.run_frame()
+
+        if render_this_frame and not self._video_enabled:
+            # Capture the rendered frame into _last_rendered
+            try:
+                self.instance._last_rendered = self.instance._screen.to_pil().convert("RGB")
+            except Exception:
+                pass
+            self._set_renderer(native, False)
+            self._frames_since_render = 0
+        elif self._video_enabled:
+            # Always update when rendering is permanently on
+            try:
+                self.instance._last_rendered = self.instance._screen.to_pil().convert("RGB")
+            except Exception:
+                pass
+            self._frames_since_render = 0
+
         self._prev_pressed_inputs = self._pressed_inputs
         self._pressed_inputs = 0
         # Sleep-based throttle (only when 1x or Nx speed is requested)
@@ -803,35 +848,15 @@ class GameBot:
 
     def get_screenshot(self):
         """
-        Capture the current screen as a PIL Image.
-        Temporarily enables video rendering for one frame.
+        Return the most recently rendered frame as a PIL Image.
+
+        No extra run_frame() call – the image was captured inside
+        _apply_inputs_and_run_frame() every _render_every frames.
+        Returns None if no frame has been rendered yet.
         """
-        if self.instance is None or self.instance._core is None:
+        if self.instance is None:
             return None
-        core = self.instance._core
-        native = self.instance._native
-
-        # Enable rendering
-        for i in range(4):
-            native.video.renderer.disableBG[i] = False
-        native.video.renderer.disableOBJ = False
-
-        # Save state, render one frame, capture, restore
-        state = core.save_state()
-        core.run_frame()
-        img = self.instance._screen.to_pil().convert("RGB")
-
-        # Restore state and disable rendering again
-        vfile = mgba.vfs.VFile.fromEmpty()
-        vfile.write(state, len(state))
-        vfile.seek(0, whence=0)
-        core.load_state(vfile)
-
-        for i in range(4):
-            native.video.renderer.disableBG[i] = True
-        native.video.renderer.disableOBJ = True
-
-        return img
+        return getattr(self.instance, "_last_rendered", None)
 
     # ── Utility ──────────────────────────────────────────────────────────
 
