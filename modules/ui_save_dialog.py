@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional
 import customtkinter as ctk
 
 from modules.config import SAVE_DIR
+from modules.app_utils import detect_monitors
 
 if TYPE_CHECKING:
     from app import App
@@ -39,7 +40,6 @@ def show_save_dialog(app: "App", count: int, rom_p: Path) -> Optional[dict]:
 
     Returns {1: "existing", 2: "new", ...} or None if the user cancels.
     """
-    from app import detect_monitors
     C = app.C
 
     dlg = ctk.CTkToplevel(app)

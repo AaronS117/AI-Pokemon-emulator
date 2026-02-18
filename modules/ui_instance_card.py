@@ -17,13 +17,14 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+from modules.app_utils import C as _C_UNUSED, BOT_MODES, detect_monitors
+
 if TYPE_CHECKING:
     from app import App, InstanceState
 
 
 def create_inst_row(app: "App", inst_id: int, state: "InstanceState"):
     """Compact status row in the main-window scroll frame."""
-    from app import BOT_MODES
     C = app.C
 
     row_frame = ctk.CTkFrame(
@@ -80,7 +81,6 @@ def focus_instance_window(app: "App", inst_id: int):
 
 def create_card(app: "App", inst_id: int, state: "InstanceState"):
     """Open a dedicated Toplevel window for this emulator instance."""
-    from app import BOT_MODES, detect_monitors
     C = app.C
 
     create_inst_row(app, inst_id, state)
@@ -307,7 +307,6 @@ def update_card(app: "App", inst_id: int, state: "InstanceState"):
 
 
 def _update_card_inner(app: "App", inst_id: int, state: "InstanceState", w: dict, win):
-    from app import BOT_MODES
     C = app.C
 
     status_colors = {

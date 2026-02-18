@@ -16,17 +16,18 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 
 from modules.config import ENCOUNTER_AREAS, SAVE_DIR
-from modules.bot_modes import ALL_MODES
+from modules.app_utils import (
+    C as _C_DEFAULT,
+    BOT_MODES,
+    detect_rom_in_dir,
+    detect_game_version_from_path,
+    save_settings,
+)
 
 if TYPE_CHECKING:
     from app import App  # only for type hints, no circular import at runtime
 
 logger = logging.getLogger(__name__)
-
-
-# ── Theme colours (mirrors app.py C dict) ────────────────────────────────────
-def _C(app: "App") -> dict:
-    return app._C  # app stores the colour dict as self._C
 
 
 # ── Collapsible section helper ────────────────────────────────────────────────
@@ -78,9 +79,6 @@ def build_sidebar(app: "App", parent):
     so the rest of app.py can read them exactly as before.
     """
     C = app.C
-
-    # ── Auto-detect ROM ───────────────────────────────────────────────────
-    from app import detect_rom_in_dir, detect_game_version_from_path, save_settings
     _saved_rom = app.settings.get("rom_path", "")
     if not _saved_rom or not Path(_saved_rom).exists():
         from modules.config import EMULATOR_DIR
@@ -236,7 +234,6 @@ def build_sidebar(app: "App", parent):
     # ════════════════════════════════════════════════════════════════════
     #  SECTION: BOT MODE  (expanded)
     # ════════════════════════════════════════════════════════════════════
-    from app import BOT_MODES
     sec_mode = make_collapsible_section(parent, "BOT MODE", C, expanded=True)
 
     app._mode_var = ctk.StringVar(value=app.settings.get("bot_mode", "manual"))

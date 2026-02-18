@@ -103,92 +103,20 @@ logging.getLogger().addHandler(_queue_handler)
 logging.getLogger().setLevel(logging.DEBUG)
 logger = logging.getLogger("app")
 
-# ── Color palette ────────────────────────────────────────────────────────────
-C = {
-    "bg_dark":    "#0f0f0f",
-    "bg_card":    "#1a1a2e",
-    "bg_input":   "#16213e",
-    "accent":     "#7c3aed",
-    "accent_h":   "#6d28d9",
-    "green":      "#22c55e",
-    "red":        "#ef4444",
-    "yellow":     "#eab308",
-    "gold":       "#fbbf24",
-    "text":       "#e2e8f0",
-    "text_dim":   "#94a3b8",
-    "border":     "#334155",
-}
-
-# ── Settings persistence ─────────────────────────────────────────────────────
-SETTINGS_FILE = ROOT_DIR / "settings.json"
-
-DEFAULT_SETTINGS = {
-    "rom_path": "",
-    "save_directory": str(SAVE_DIR),
-    "speed_multiplier": 0,
-    "max_instances": 1,
-    "target_area": "route1",
-    "video_enabled": False,
-    "bot_mode": "encounter_farm",
-    "window_geometry": "",
-}
-
-
-_GAME_PATTERNS = {
-    "firered":   re.compile(r"fire.?red", re.IGNORECASE),
-    "leafgreen":  re.compile(r"leaf.?green", re.IGNORECASE),
-    "emerald":   re.compile(r"emerald", re.IGNORECASE),
-    "ruby":      re.compile(r"\bruby\b", re.IGNORECASE),
-    "sapphire":  re.compile(r"sapphire", re.IGNORECASE),
-}
-
-
-def detect_rom_in_dir(directory: Path) -> Optional[Path]:
-    """Scan *directory* for any .gba file matching a known game name (case-insensitive)."""
-    if not directory.exists():
-        return None
-    for gba in sorted(directory.glob("*.gba")):
-        stem = gba.stem
-        for version, pat in _GAME_PATTERNS.items():
-            if pat.search(stem):
-                logger.info("Auto-detected ROM: %s  (version=%s)", gba.name, version)
-                return gba
-    # Fallback: return any .gba found
-    fallback = next(directory.glob("*.gba"), None)
-    if fallback:
-        logger.info("Auto-detected ROM (unknown version): %s", fallback.name)
-    return fallback
-
-
-def detect_game_version_from_path(rom_path: Path) -> str:
-    """Infer game version string from ROM filename."""
-    stem = rom_path.stem
-    for version, pat in _GAME_PATTERNS.items():
-        if pat.search(stem):
-            return version
-    return "firered"
+# ── Shared utilities (colour palette, settings, ROM/monitor detection, BOT_MODES)
+from modules.app_utils import (
+    C, DEFAULT_SETTINGS, SETTINGS_FILE,
+    BOT_MODES,
+    load_settings, save_settings,
+    detect_rom_in_dir, detect_game_version_from_path,
+    detect_monitors, get_secondary_monitor_origin,
+)
 
 
 def save_exists_for_instance(instance_id: int, rom_path: Path) -> bool:
     """Return True if a non-empty .sav file exists for this instance."""
-    from modules.config import SAVE_DIR as _SD
-    sav = _SD / str(instance_id) / f"{rom_path.stem}.sav"
+    sav = SAVE_DIR / str(instance_id) / f"{rom_path.stem}.sav"
     return sav.exists() and sav.stat().st_size > 0
-
-
-def load_settings() -> dict:
-    if SETTINGS_FILE.exists():
-        try:
-            with open(SETTINGS_FILE, "r") as f:
-                return {**DEFAULT_SETTINGS, **json.load(f)}
-        except Exception:
-            pass
-    return dict(DEFAULT_SETTINGS)
-
-
-def save_settings(settings: dict) -> None:
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(settings, f, indent=2)
 
 
 # ── CPU Generation Detection ─────────────────────────────────────────────────
