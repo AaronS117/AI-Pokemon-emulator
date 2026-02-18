@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import platform
+import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -73,10 +75,32 @@ except ImportError:
     AIFrameResult = None  # type: ignore[assignment,misc]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
+
+# Thread-safe queue that feeds the live log window
+_log_queue: queue.Queue = queue.Queue(maxsize=5000)
+
+
+class _QueueHandler(logging.Handler):
+    """Logging handler that pushes records into _log_queue for the GUI."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _log_queue.put_nowait(self.format(record))
+        except queue.Full:
+            pass  # drop oldest if full
+
+
+_queue_handler = _QueueHandler()
+_queue_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+                      datefmt="%H:%M:%S")
+)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logging.getLogger().addHandler(_queue_handler)
+logging.getLogger().setLevel(logging.DEBUG)
 logger = logging.getLogger("app")
 
 # ── Color palette ────────────────────────────────────────────────────────────
@@ -108,6 +132,48 @@ DEFAULT_SETTINGS = {
     "bot_mode": "encounter_farm",
     "window_geometry": "1360x820",
 }
+
+
+_GAME_PATTERNS = {
+    "firered":   re.compile(r"fire.?red", re.IGNORECASE),
+    "leafgreen":  re.compile(r"leaf.?green", re.IGNORECASE),
+    "emerald":   re.compile(r"emerald", re.IGNORECASE),
+    "ruby":      re.compile(r"\bruby\b", re.IGNORECASE),
+    "sapphire":  re.compile(r"sapphire", re.IGNORECASE),
+}
+
+
+def detect_rom_in_dir(directory: Path) -> Optional[Path]:
+    """Scan *directory* for any .gba file matching a known game name (case-insensitive)."""
+    if not directory.exists():
+        return None
+    for gba in sorted(directory.glob("*.gba")):
+        stem = gba.stem
+        for version, pat in _GAME_PATTERNS.items():
+            if pat.search(stem):
+                logger.info("Auto-detected ROM: %s  (version=%s)", gba.name, version)
+                return gba
+    # Fallback: return any .gba found
+    fallback = next(directory.glob("*.gba"), None)
+    if fallback:
+        logger.info("Auto-detected ROM (unknown version): %s", fallback.name)
+    return fallback
+
+
+def detect_game_version_from_path(rom_path: Path) -> str:
+    """Infer game version string from ROM filename."""
+    stem = rom_path.stem
+    for version, pat in _GAME_PATTERNS.items():
+        if pat.search(stem):
+            return version
+    return "firered"
+
+
+def save_exists_for_instance(instance_id: int, rom_path: Path) -> bool:
+    """Return True if a non-empty .sav file exists for this instance."""
+    from modules.config import SAVE_DIR as _SD
+    sav = _SD / str(instance_id) / f"{rom_path.stem}.sav"
+    return sav.exists() and sav.stat().st_size > 0
 
 
 def load_settings() -> dict:
@@ -365,6 +431,122 @@ def get_ai_bridge():
     return _ai_bridge
 
 
+def _worker_capture_screen(bot, state) -> None:
+    """Grab a screenshot from the emulator and store it in state."""
+    try:
+        sc = bot.get_screenshot()
+        if sc:
+            state.last_screenshot = sc
+    except Exception:
+        pass
+
+
+def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RED") -> bool:
+    """
+    Attempt to navigate the new-game intro sequence for Fire Red.
+    Types the player name and advances through Oak's speech.
+    Returns True if we reach OVERWORLD/CHOOSE_STARTER, False on timeout.
+    """
+    iid = state.instance_id
+    logger.info("[Instance %d] Fresh save detected – starting new-game intro sequence", iid)
+    logger.info("[Instance %d] Will type player name: %s", iid, player_name)
+
+    # GBA character map for the naming screen (Fire Red A-Z row)
+    CHAR_MAP = {c: i for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}
+    # Fire Red naming screen layout: 9 chars per row, A=col0 row0
+    CHARS_PER_ROW = 9
+
+    def _press_stop():
+        return state.should_stop
+
+    # Step 1: Advance through intro (Game Freak logo, title screen)
+    logger.info("[Instance %d] Advancing through intro screens (pressing A)…", iid)
+    for _ in range(300):
+        if _press_stop():
+            return False
+        bot.press_button(GBAButton.A)
+        bot.advance_frames(8)
+        state.frame_count = bot.frame_count
+        gs = bot.get_game_state()
+        if gs == GState.MAIN_MENU:
+            break
+
+    # Step 2: Start new game from main menu
+    logger.info("[Instance %d] Selecting 'New Game' from main menu", iid)
+    for _ in range(60):
+        if _press_stop():
+            return False
+        bot.press_button(GBAButton.A)
+        bot.advance_frames(10)
+        state.frame_count = bot.frame_count
+
+    # Step 3: Skip Oak's intro speech (keep pressing A/B)
+    logger.info("[Instance %d] Skipping Oak's intro speech…", iid)
+    for _ in range(400):
+        if _press_stop():
+            return False
+        bot.press_button(GBAButton.A)
+        bot.advance_frames(6)
+        state.frame_count = bot.frame_count
+        gs = bot.get_game_state()
+        if gs == GState.NAMING_SCREEN:
+            logger.info("[Instance %d] Reached naming screen", iid)
+            break
+
+    # Step 4: Type player name on naming screen
+    logger.info("[Instance %d] Typing player name '%s'…", iid, player_name)
+    cur_col, cur_row = 0, 0
+    for ch in player_name.upper():
+        if _press_stop():
+            return False
+        if ch not in CHAR_MAP:
+            continue
+        target_idx = CHAR_MAP[ch]
+        target_col = target_idx % CHARS_PER_ROW
+        target_row = target_idx // CHARS_PER_ROW
+        # Navigate to character
+        dc = target_col - cur_col
+        dr = target_row - cur_row
+        for _ in range(abs(dr)):
+            btn = GBAButton.DOWN if dr > 0 else GBAButton.UP
+            bot.press_button(btn)
+            bot.advance_frames(4)
+        for _ in range(abs(dc)):
+            btn = GBAButton.RIGHT if dc > 0 else GBAButton.LEFT
+            bot.press_button(btn)
+            bot.advance_frames(4)
+        bot.press_button(GBAButton.A)
+        bot.advance_frames(6)
+        cur_col, cur_row = target_col, target_row
+        state.frame_count = bot.frame_count
+        logger.debug("[Instance %d] Typed '%s'", iid, ch)
+
+    # Confirm name (navigate to OK button – bottom row)
+    logger.info("[Instance %d] Confirming name", iid)
+    for _ in range(5):
+        bot.press_button(GBAButton.DOWN)
+        bot.advance_frames(4)
+    bot.press_button(GBAButton.A)
+    bot.advance_frames(30)
+
+    # Step 5: Skip remaining cutscenes until overworld/choose starter
+    logger.info("[Instance %d] Skipping post-name cutscenes…", iid)
+    for _ in range(600):
+        if _press_stop():
+            return False
+        bot.press_button(GBAButton.A)
+        bot.advance_frames(8)
+        state.frame_count = bot.frame_count
+        _worker_capture_screen(bot, state)
+        gs = bot.get_game_state()
+        if gs in (GState.OVERWORLD, GState.CHOOSE_STARTER):
+            logger.info("[Instance %d] Reached playable state: %s", iid, gs.name)
+            return True
+
+    logger.warning("[Instance %d] New-game intro timed out – switching to manual mode", iid)
+    return False
+
+
 def emulator_worker(
     state: InstanceState,
     rom_path: str,
@@ -372,69 +554,94 @@ def emulator_worker(
     speed: int,
     cpu_count: int,
 ):
-    """Background thread running one emulator instance.
+    """Background thread running one emulator instance."""
+    iid = state.instance_id
+    wlog = logging.getLogger(f"worker.{iid}")
+    set_thread_affinity(iid, cpu_count)
+    state.cpu_core = (iid + 1) % cpu_count
 
-    Uses the unified BotMode.step() loop to dispatch all 11 bot modes.
-    Integrates stats tracking, async DB writes, and full Pokémon decryption.
-    """
-    set_thread_affinity(state.instance_id, cpu_count)
-    state.cpu_core = (state.instance_id + 1) % cpu_count
+    wlog.info("=" * 60)
+    wlog.info("Instance %d starting  |  ROM: %s", iid, rom_path)
+    wlog.info("Instance %d  seed=0x%04X  TID=%d  SID=%d  mode=%s",
+              iid, state.seed, state.tid, state.sid, state.bot_mode)
+
+    # ── Shiny math summary ────────────────────────────────────────────────
+    from modules.tid_engine import TrainerID as _TID
+    _tid_obj = _TID(seed=state.seed, tid=state.tid, sid=state.sid)
+    wlog.info("Instance %d  Shiny check: TID^SID = 0x%04X  (threshold <8 = shiny)",
+              iid, state.tid ^ state.sid)
+    wlog.info("Instance %d  Any PID where (TID^SID^PID_high^PID_low) < 8 is SHINY", iid)
+    # Show a few example shiny PIDs
+    _examples = []
+    for _pv in range(0, 0xFFFFFFFF, 0x10000):
+        if _tid_obj.is_shiny_pid(_pv):
+            _examples.append(f"0x{_pv:08X}")
+        if len(_examples) >= 4:
+            break
+    wlog.info("Instance %d  Example shiny PIDs: %s", iid, ", ".join(_examples) or "none in first scan")
 
     try:
         from modules.game_bot import GameBot, GBAButton, GameState as GState
         state.status = "booting"
         state.speed_multiplier = speed
 
-        bot = GameBot()
-        bot.launch(
-            seed=state.seed,
-            tid=state.tid,
-            sid=state.sid,
-            rom_path=Path(rom_path),
-        )
+        # ── Check save file ───────────────────────────────────────────────
+        _rom_p = Path(rom_path)
+        _has_save = save_exists_for_instance(iid, _rom_p)
+        if _has_save:
+            wlog.info("Instance %d  Save file found – will boot into existing game", iid)
+        else:
+            wlog.warning("Instance %d  NO SAVE FILE found at emulator/saves/%d/%s.sav",
+                         iid, iid, _rom_p.stem)
+            wlog.warning("Instance %d  Will attempt new-game intro sequence, then fall back to MANUAL mode", iid)
 
-        # ── Boot: advance frames until game reaches a playable state ──────
-        # NOTE: pokebot-gen3 requires a save file that is already past the
-        # new-game intro (player named, starter chosen, in overworld).
-        # An empty .sav will boot to the intro cutscene which the bot
-        # cannot navigate automatically.  We advance up to 600 frames
-        # (~10s) pressing A to skip any title/intro screens, then hand
-        # off to the mode regardless so the user can take manual control.
-        BOOT_PRESS_INTERVAL = 30   # press A every 30 frames
-        MAX_BOOT_FRAMES = 600      # ~10 seconds at 60fps
-        for bf in range(MAX_BOOT_FRAMES):
-            if state.should_stop:
-                bot.destroy()
-                state.status = "stopped"
-                return
-            if bf % BOOT_PRESS_INTERVAL == 0:
-                bot.press_button(GBAButton.A)
-            else:
-                bot.advance_frames(1)
-            state.frame_count = bot.frame_count
-            # Capture a screenshot periodically so the window shows something
-            if bf % 60 == 0:
-                try:
-                    sc = bot.get_screenshot()
-                    if sc:
-                        state.last_screenshot = sc
-                except Exception:
-                    pass
-            # If we reach a clearly playable state early, stop waiting
-            if bf > 60:
-                gs = bot.get_game_state()
-                if gs in (GState.OVERWORLD, GState.BATTLE,
-                          GState.CHOOSE_STARTER, GState.MAIN_MENU):
-                    break
+        bot = GameBot()
+        bot.launch(seed=state.seed, tid=state.tid, sid=state.sid, rom_path=_rom_p)
+        wlog.info("Instance %d  Emulator launched (headless mGBA)", iid)
+
+        # ── Boot sequence ─────────────────────────────────────────────────
+        if not _has_save:
+            # Try to play through the new-game intro automatically
+            _reached_game = _worker_new_game_intro(bot, state, GBAButton, GState)
+            if not _reached_game:
+                wlog.warning("Instance %d  Could not complete intro – enabling MANUAL mode", iid)
+                state.manual_control = True
+                state.status = "manual"
+                wlog.info("Instance %d  Manual mode active. Use the Control button in the instance window.", iid)
+                wlog.info("Instance %d  Default keys: A=a  B=s  Start=Enter  Select=Backspace  D-pad=Arrows", iid)
+        else:
+            # Existing save: advance frames pressing A to skip title
+            wlog.info("Instance %d  Booting from save – advancing past title screen…", iid)
+            for bf in range(600):
+                if state.should_stop:
+                    bot.destroy()
+                    state.status = "stopped"
+                    return
+                if bf % 30 == 0:
+                    bot.press_button(GBAButton.A)
+                else:
+                    bot.advance_frames(1)
+                state.frame_count = bot.frame_count
+                if bf % 60 == 0:
+                    _worker_capture_screen(bot, state)
+                if bf > 60:
+                    gs = bot.get_game_state()
+                    if gs in (GState.OVERWORLD, GState.BATTLE,
+                              GState.CHOOSE_STARTER, GState.MAIN_MENU):
+                        wlog.info("Instance %d  Reached game state: %s", iid, gs.name)
+                        break
+
         state.status = "running"
+        wlog.info("Instance %d  Boot complete – entering main loop (mode=%s)", iid, state.bot_mode)
 
         # Navigate to area for encounter-based modes
         if state.bot_mode in ("encounter_farm", "sweet_scent", "rock_smash",
                               "safari_zone", "fishing"):
+            wlog.info("Instance %d  Navigating to area: %s", iid, area)
             try:
                 bot.navigate_to_area(area)
             except Exception as exc:
-                logger.warning("Navigation failed (continuing): %s", exc)
+                wlog.warning("Instance %d  Navigation failed (continuing): %s", iid, exc)
 
         # Instantiate the correct BotMode
         mode = _create_mode(state.bot_mode, bot)
@@ -711,6 +918,22 @@ class App(ctk.CTk):
         hw_frame.pack(side="right", padx=20)
 
         ctk.CTkButton(
+            hw_frame, text="📋 Log", width=70, height=30,
+            font=ctk.CTkFont(size=12),
+            fg_color=C["bg_dark"], hover_color="#1a3a1a",
+            border_width=1, border_color=C["border"],
+            command=self._open_log_window,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            hw_frame, text="✨ Shiny Math", width=100, height=30,
+            font=ctk.CTkFont(size=12),
+            fg_color=C["bg_dark"], hover_color="#2a1a3a",
+            border_width=1, border_color=C["border"],
+            command=self._open_shiny_math,
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkButton(
             hw_frame, text="⚙ Settings", width=90, height=30,
             font=ctk.CTkFont(size=12),
             fg_color=C["bg_dark"], hover_color=C["accent"],
@@ -759,17 +982,17 @@ class App(ctk.CTk):
         rom_frame = ctk.CTkFrame(parent, fg_color="transparent")
         rom_frame.pack(fill="x", **pad)
 
-        # Auto-detect ROM: prefer saved path, then canonical firered.gba, then any .gba in emulator/
+        # Auto-detect ROM: prefer saved path, then scan emulator/ for any known game ROM
         _saved_rom = self.settings.get("rom_path", "")
         if not _saved_rom or not Path(_saved_rom).exists():
             from modules.config import EMULATOR_DIR
-            _canonical = EMULATOR_DIR / "firered.gba"
-            if _canonical.exists():
-                _saved_rom = str(_canonical)
-            else:
-                _found = sorted(EMULATOR_DIR.glob("*.gba"))
-                if _found:
-                    _saved_rom = str(_found[0])
+            _found_rom = detect_rom_in_dir(EMULATOR_DIR)
+            if _found_rom:
+                _saved_rom = str(_found_rom)
+                # Also auto-set game version from filename
+                _detected_ver = detect_game_version_from_path(_found_rom)
+                self.settings["game_version"] = _detected_ver
+                logger.info("Auto-detected game version: %s from %s", _detected_ver, _found_rom.name)
             if _saved_rom:
                 self.settings["rom_path"] = _saved_rom
                 save_settings(self.settings)
@@ -1682,6 +1905,265 @@ class App(ctk.CTk):
                 win.configure(fg_color=C["gold"])
             except Exception:
                 pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  LOG WINDOW
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _open_log_window(self):
+        """Open a floating live log window showing all app/AI/bot activity."""
+        if hasattr(self, "_log_win"):
+            try:
+                if self._log_win.winfo_exists():
+                    self._log_win.lift()
+                    self._log_win.focus_set()
+                    return
+            except Exception:
+                pass
+
+        win = ctk.CTkToplevel(self)
+        win.title("Live Log – Gen 3 Shiny Hunter")
+        win.geometry("900x560+60+60")
+        win.configure(fg_color=C["bg_dark"])
+        self._log_win = win
+
+        toolbar = ctk.CTkFrame(win, fg_color=C["bg_card"], corner_radius=0, height=40)
+        toolbar.pack(fill="x")
+        toolbar.pack_propagate(False)
+
+        ctk.CTkLabel(toolbar, text="LIVE LOG",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["accent"]).pack(side="left", padx=12)
+
+        _level_var = ctk.StringVar(value="ALL")
+        ctk.CTkLabel(toolbar, text="Level:", font=ctk.CTkFont(size=11),
+                     text_color=C["text_dim"]).pack(side="left", padx=(12, 4))
+        ctk.CTkOptionMenu(toolbar, variable=_level_var,
+                          values=["ALL", "DEBUG", "INFO", "WARNING", "ERROR"],
+                          width=90, height=26,
+                          fg_color=C["bg_input"], button_color=C["accent"],
+                          button_hover_color=C["accent_h"],
+                          dropdown_fg_color=C["bg_card"],
+                          font=ctk.CTkFont(size=11)).pack(side="left")
+
+        _search_var = ctk.StringVar()
+        ctk.CTkLabel(toolbar, text="Filter:", font=ctk.CTkFont(size=11),
+                     text_color=C["text_dim"]).pack(side="left", padx=(12, 4))
+        ctk.CTkEntry(toolbar, textvariable=_search_var, width=160, height=26,
+                     fg_color=C["bg_input"], border_color=C["border"],
+                     font=ctk.CTkFont(size=11)).pack(side="left")
+
+        _autoscroll = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(toolbar, text="Auto-scroll", variable=_autoscroll,
+                        font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+                        fg_color=C["accent"], hover_color=C["accent_h"],
+                        border_color=C["border"], width=20).pack(side="left", padx=12)
+
+        txt = ctk.CTkTextbox(win, fg_color="#0a0a0a", text_color=C["text"],
+                             font=ctk.CTkFont(family="Courier New", size=11),
+                             wrap="word", state="disabled")
+
+        def _clear_log():
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.configure(state="disabled")
+            _line_count[0] = 0
+
+        ctk.CTkButton(toolbar, text="Clear", width=60, height=26,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=C["bg_dark"], hover_color=C["red"],
+                      border_width=1, border_color=C["border"],
+                      command=_clear_log).pack(side="right", padx=8)
+
+        def _export_log():
+            import tkinter.filedialog as _fd
+            path = _fd.asksaveasfilename(
+                title="Export Log", defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            if path:
+                txt.configure(state="normal")
+                content = txt.get("1.0", "end")
+                txt.configure(state="disabled")
+                Path(path).write_text(content, encoding="utf-8")
+
+        ctk.CTkButton(toolbar, text="Export", width=65, height=26,
+                      font=ctk.CTkFont(size=11),
+                      fg_color=C["bg_dark"], hover_color=C["accent"],
+                      border_width=1, border_color=C["border"],
+                      command=_export_log).pack(side="right", padx=(0, 4))
+
+        txt.pack(fill="both", expand=True)
+
+        # Color tags
+        txt.tag_config("DEBUG",    foreground="#6b7280")
+        txt.tag_config("INFO",     foreground="#e2e8f0")
+        txt.tag_config("WARNING",  foreground="#eab308")
+        txt.tag_config("ERROR",    foreground="#ef4444")
+        txt.tag_config("CRITICAL", foreground="#ff0000")
+        txt.tag_config("SHINY",    foreground="#fbbf24")
+        txt.tag_config("WORKER",   foreground="#a78bfa")
+        txt.tag_config("AI",       foreground="#22c55e")
+
+        status_bar = ctk.CTkFrame(win, fg_color=C["bg_card"], corner_radius=0, height=24)
+        status_bar.pack(fill="x", side="bottom")
+        status_bar.pack_propagate(False)
+        _line_count_lbl = ctk.CTkLabel(status_bar, text="0 lines",
+                                       font=ctk.CTkFont(size=10), text_color=C["text_dim"])
+        _line_count_lbl.pack(side="right", padx=8)
+        _queue_lbl = ctk.CTkLabel(status_bar, text="Queue: 0",
+                                  font=ctk.CTkFont(size=10), text_color=C["text_dim"])
+        _queue_lbl.pack(side="left", padx=8)
+
+        _line_count = [0]
+        MAX_LINES = 2000
+
+        def _get_tag(line: str) -> str:
+            if "DEBUG" in line:
+                return "DEBUG"
+            if "WARNING" in line:
+                return "WARNING"
+            if "ERROR" in line or "CRITICAL" in line:
+                return "ERROR"
+            if "worker." in line or "Worker" in line or "Instance" in line:
+                return "WORKER"
+            if "ai." in line or " AI " in line:
+                return "AI"
+            if "SHINY" in line or "shiny" in line:
+                return "SHINY"
+            return "INFO"
+
+        def _poll_log():
+            if not win.winfo_exists():
+                return
+            level_filter = _level_var.get()
+            search_filter = _search_var.get().lower()
+            added = 0
+            txt.configure(state="normal")
+            try:
+                for _ in range(300):
+                    line = _log_queue.get_nowait()
+                    if level_filter != "ALL":
+                        if level_filter not in line:
+                            continue
+                    if search_filter and search_filter not in line.lower():
+                        continue
+                    tag = _get_tag(line)
+                    txt.insert("end", line + "\n", tag)
+                    _line_count[0] += 1
+                    added += 1
+            except queue.Empty:
+                pass
+            if _line_count[0] > MAX_LINES:
+                txt.delete("1.0", f"{_line_count[0] - MAX_LINES}.0")
+                _line_count[0] = MAX_LINES
+            txt.configure(state="disabled")
+            if added and _autoscroll.get():
+                txt.see("end")
+            _line_count_lbl.configure(text=f"{_line_count[0]:,} lines")
+            _queue_lbl.configure(text=f"Queue: {_log_queue.qsize()}")
+            win.after(150, _poll_log)
+
+        _poll_log()
+        logger.info("Log window opened – all logging output captured here")
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  SHINY MATH WINDOW
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _open_shiny_math(self):
+        """Show shiny/perfect IV math for all running instances."""
+        win = ctk.CTkToplevel(self)
+        win.title("Shiny & Perfect IV Math")
+        win.geometry("720x580")
+        win.configure(fg_color=C["bg_dark"])
+        win.resizable(True, True)
+
+        ctk.CTkLabel(win, text="SHINY & PERFECT IV CALCULATOR",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=C["accent"]).pack(anchor="w", padx=16, pady=(12, 4))
+        ctk.CTkLabel(win,
+                     text="Gen 3 shiny formula:  (TID XOR SID XOR PID_high16 XOR PID_low16) < 8\n"
+                          "Perfect IVs require specific PID+nature combos — use PokeFinder with TID/SID.",
+                     font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=C["bg_dark"])
+        scroll.pack(fill="both", expand=True, padx=8, pady=4)
+
+        from modules.tid_engine import TrainerID as _TID
+
+        instances_to_show = self.instances if self.instances else {
+            0: type("S", (), {"seed": 0x1234, "tid": 0, "sid": 0,
+                              "bot_mode": "encounter_farm"})()
+        }
+
+        for iid, state in instances_to_show.items():
+            tid_obj = _TID(seed=state.seed, tid=state.tid, sid=state.sid)
+            xor_val = state.tid ^ state.sid
+
+            card = ctk.CTkFrame(scroll, fg_color=C["bg_card"],
+                                corner_radius=8, border_width=1, border_color=C["border"])
+            card.pack(fill="x", pady=4, padx=4)
+
+            hdr = ctk.CTkFrame(card, fg_color=C["bg_input"], corner_radius=0)
+            hdr.pack(fill="x")
+            ctk.CTkLabel(hdr,
+                         text=f"Instance #{iid}  |  seed=0x{state.seed:04X}  "
+                              f"TID={state.tid:05d}  SID={state.sid:05d}",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=C["text"]).pack(side="left", padx=12, pady=6)
+            ctk.CTkLabel(hdr, text=f"TID^SID = 0x{xor_val:04X}",
+                         font=ctk.CTkFont(size=11),
+                         text_color=C["accent"]).pack(side="right", padx=12)
+
+            body = ctk.CTkFrame(card, fg_color="transparent")
+            body.pack(fill="x", padx=12, pady=8)
+
+            ctk.CTkLabel(body,
+                         text=f"Shiny:  (0x{state.tid:04X} ^ 0x{state.sid:04X} ^ PID>>16 ^ PID&0xFFFF) < 8",
+                         font=ctk.CTkFont(family="Courier New", size=11),
+                         text_color=C["text_dim"]).pack(anchor="w")
+            ctk.CTkLabel(body,
+                         text=f"Base odds: 1 in 8,192  ({100/8192:.4f}%)  "
+                              f"|  With Shiny Charm: 1 in 1,365",
+                         font=ctk.CTkFont(size=11),
+                         text_color=C["yellow"]).pack(anchor="w", pady=(4, 0))
+
+            # Scan for shiny PIDs
+            shiny_pids = []
+            for _hi in range(0, 0x10000):
+                for _lo in range(max(0, _hi - 7), min(0x10000, _hi + 8)):
+                    pv = (_hi << 16) | _lo
+                    if tid_obj.is_shiny_pid(pv):
+                        shiny_pids.append(f"0x{pv:08X}")
+                if len(shiny_pids) >= 16:
+                    break
+
+            ctk.CTkLabel(body, text="Sample shiny PIDs (first 16):",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=C["text"]).pack(anchor="w", pady=(8, 2))
+            pid_grid = ctk.CTkFrame(body, fg_color="transparent")
+            pid_grid.pack(anchor="w")
+            for i, pid_str in enumerate(shiny_pids[:16]):
+                ctk.CTkLabel(pid_grid, text=pid_str,
+                             font=ctk.CTkFont(family="Courier New", size=10),
+                             text_color=C["gold"],
+                             width=110).grid(row=i // 4, column=i % 4, padx=4, pady=1, sticky="w")
+
+            ctk.CTkLabel(body,
+                         text="For perfect IVs: use PokeFinder → Stationary/Wild RNG → enter TID/SID above.",
+                         font=ctk.CTkFont(size=10), text_color=C["text_dim"]).pack(anchor="w", pady=(8, 0))
+
+        def _copy_all():
+            lines = [f"Instance {iid}: TID={s.tid} SID={s.sid} seed=0x{s.seed:04X}"
+                     for iid, s in self.instances.items()]
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(lines) if lines else "No instances running")
+
+        ctk.CTkButton(win, text="Copy all TID/SID to clipboard", width=220, height=30,
+                      font=ctk.CTkFont(size=12),
+                      fg_color=C["accent"], hover_color=C["accent_h"],
+                      command=_copy_all).pack(pady=8)
 
     # ─────────────────────────────────────────────────────────────────────
     #  SETTINGS WINDOW
