@@ -1,0 +1,1444 @@
+"""
+Gen 3 Shiny Automation – Desktop Application
+=============================================
+Run with:  python app.py
+
+Modern dark-themed GUI for managing headless mGBA emulator instances
+that hunt for shiny Pokemon in Generation 3 games.
+
+Features:
+  - Modern dark UI via customtkinter
+  - CPU generation detection with per-core thread affinity
+  - ROM browser with validation
+  - Multiple bot modes (encounter farm, starter reset, static encounter)
+  - Per-instance speed, frame counter, live screen preview
+  - Start / stop / pause individual or all instances
+  - Shiny encounter log with live counter
+  - Persistent settings (settings.json)
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import logging
+import os
+import platform
+import struct
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+# ── Ensure project root is importable ────────────────────────────────────────
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import customtkinter as ctk
+import psutil
+from PIL import Image, ImageTk
+
+# Project modules
+from modules.config import (
+    ENCOUNTER_AREAS,
+    GameVersion,
+    SAVE_DIR,
+)
+from modules.database import (
+    init_db, log_shiny, total_shinies, recent_shinies,
+    get_living_dex_progress, mark_pokemon_owned, log_cheat as db_log_cheat,
+    is_save_legitimate,
+)
+from modules.tid_engine import seed_to_ids
+from modules.bot_modes import ALL_MODES, MODE_DESCRIPTIONS, ModeResult, ModeStatus, BotMode
+from modules.cheat_manager import CheatManager, CheatCategory
+from modules.evolution_data import POKEDEX, NATIONAL_DEX_SIZE, living_dex_requirements
+from modules.stats_dashboard import StatsTracker, shiny_probability
+from modules.performance import get_async_worker, PerformanceMonitor, perf_monitor
+from modules.notifications import NotificationManager
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("app")
+
+# ── Color palette ────────────────────────────────────────────────────────────
+C = {
+    "bg_dark":    "#0f0f0f",
+    "bg_card":    "#1a1a2e",
+    "bg_input":   "#16213e",
+    "accent":     "#7c3aed",
+    "accent_h":   "#6d28d9",
+    "green":      "#22c55e",
+    "red":        "#ef4444",
+    "yellow":     "#eab308",
+    "gold":       "#fbbf24",
+    "text":       "#e2e8f0",
+    "text_dim":   "#94a3b8",
+    "border":     "#334155",
+}
+
+# ── Settings persistence ─────────────────────────────────────────────────────
+SETTINGS_FILE = ROOT_DIR / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "rom_path": "",
+    "save_directory": str(SAVE_DIR),
+    "speed_multiplier": 0,
+    "max_instances": 1,
+    "target_area": "route1",
+    "video_enabled": False,
+    "bot_mode": "encounter_farm",
+    "window_geometry": "1360x820",
+}
+
+
+def load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return {**DEFAULT_SETTINGS, **json.load(f)}
+        except Exception:
+            pass
+    return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(settings: dict) -> None:
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+
+# ── CPU Generation Detection ─────────────────────────────────────────────────
+
+def detect_cpu_details() -> dict:
+    """Detect CPU vendor, generation, microarchitecture, and capabilities."""
+    proc = platform.processor()
+    cpu_physical = psutil.cpu_count(logical=False) or 1
+    cpu_logical = psutil.cpu_count(logical=True) or 1
+    freq = psutil.cpu_freq()
+    freq_ghz = round(freq.current / 1000, 2) if freq else 0
+    ram_gb = round(psutil.virtual_memory().total / (1024 ** 3), 1)
+
+    # Parse vendor / family / model from platform.processor()
+    vendor = "Unknown"
+    family = 0
+    model = 0
+    stepping = 0
+    arch_name = "Unknown"
+    gen_label = ""
+
+    if "AuthenticAMD" in proc or "AMD" in proc:
+        vendor = "AMD"
+        parts = proc.split()
+        for i, p in enumerate(parts):
+            if p == "Family" and i + 1 < len(parts):
+                try: family = int(parts[i + 1])
+                except ValueError: pass
+            elif p == "Model" and i + 1 < len(parts):
+                try: model = int(parts[i + 1])
+                except ValueError: pass
+            elif p == "Stepping" and i + 1 < len(parts):
+                try: stepping = int(parts[i + 1].rstrip(","))
+                except ValueError: pass
+
+        # AMD family → microarchitecture
+        amd_families = {
+            23: ("Zen / Zen+ / Zen 2", "Ryzen 1000-3000"),
+            25: ("Zen 3 / Zen 3+", "Ryzen 5000"),
+            26: ("Zen 5", "Ryzen 9000"),
+        }
+        if family in amd_families:
+            arch_name, gen_label = amd_families[family]
+        elif family == 25 and model >= 96:
+            arch_name, gen_label = "Zen 4", "Ryzen 7000"
+
+    elif "GenuineIntel" in proc or "Intel" in proc:
+        vendor = "Intel"
+        parts = proc.split()
+        for i, p in enumerate(parts):
+            if p == "Family" and i + 1 < len(parts):
+                try: family = int(parts[i + 1])
+                except ValueError: pass
+            elif p == "Model" and i + 1 < len(parts):
+                try: model = int(parts[i + 1])
+                except ValueError: pass
+
+        # Intel model → generation (simplified)
+        intel_gens = {
+            (6, 151): ("Alder Lake", "12th Gen"),
+            (6, 154): ("Alder Lake", "12th Gen"),
+            (6, 183): ("Raptor Lake", "13th Gen"),
+            (6, 186): ("Raptor Lake", "14th Gen"),
+            (6, 189): ("Arrow Lake", "15th Gen"),
+        }
+        key = (family, model)
+        if key in intel_gens:
+            arch_name, gen_label = intel_gens[key]
+
+    # Determine optimal instance count based on CPU
+    # Each mGBA instance uses ~1 core at full speed
+    # Reserve 1 core for OS + GUI
+    max_by_cpu = max(1, cpu_physical - 1)
+    max_by_ram = max(1, int(ram_gb // 1.5))
+    suggested_max = min(max_by_cpu, max_by_ram, 8)
+
+    # Performance tier
+    if freq_ghz >= 4.0 and cpu_physical >= 6:
+        perf_tier = "Excellent"
+        perf_note = "Can run max instances at full speed"
+    elif freq_ghz >= 3.5 and cpu_physical >= 4:
+        perf_tier = "Good"
+        perf_note = "Comfortable multi-instance hunting"
+    else:
+        perf_tier = "Moderate"
+        perf_note = "Recommend 1-2 instances"
+
+    return {
+        "vendor": vendor,
+        "family": family,
+        "model": model,
+        "stepping": stepping,
+        "arch_name": arch_name,
+        "gen_label": gen_label,
+        "cpu_physical": cpu_physical,
+        "cpu_logical": cpu_logical,
+        "freq_ghz": freq_ghz,
+        "ram_gb": ram_gb,
+        "os": f"{platform.system()} {platform.release()}",
+        "python": platform.python_version(),
+        "suggested_max": suggested_max,
+        "perf_tier": perf_tier,
+        "perf_note": perf_note,
+        "smt": cpu_logical > cpu_physical,
+    }
+
+
+def set_thread_affinity(thread_index: int, cpu_count: int) -> None:
+    """Pin the current thread to a specific CPU core (Windows only)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        handle = ctypes.windll.kernel32.GetCurrentThread()
+        core = (thread_index + 1) % cpu_count  # skip core 0 (GUI)
+        mask = 1 << core
+        ctypes.windll.kernel32.SetThreadAffinityMask(handle, mask)
+    except Exception:
+        pass
+
+
+# ── Bot Modes ────────────────────────────────────────────────────────────────
+
+BOT_MODES = {
+    "encounter_farm": {
+        "label": "Wild Encounter Farm",
+        "desc": "Walk in grass to trigger random encounters.",
+        "status": "Ready",
+    },
+    "starter_reset": {
+        "label": "Starter Soft Reset",
+        "desc": "Soft-reset and check starter for shininess.",
+        "status": "Ready",
+    },
+    "static_encounter": {
+        "label": "Static Encounter",
+        "desc": "Soft-reset in front of a legendary/gift.",
+        "status": "Ready",
+    },
+    "fishing": {
+        "label": "Fishing",
+        "desc": "Fish with registered rod for shiny water Pokémon.",
+        "status": "Ready",
+    },
+    "sweet_scent": {
+        "label": "Sweet Scent",
+        "desc": "Guaranteed encounters via Sweet Scent field move.",
+        "status": "Ready",
+    },
+    "breeding": {
+        "label": "Breeding / Egg Hatch",
+        "desc": "Hatch daycare eggs and check for shinies.",
+        "status": "Ready",
+    },
+    "safari_zone": {
+        "label": "Safari Zone",
+        "desc": "Hunt shinies in the Safari Zone.",
+        "status": "Ready",
+    },
+    "rock_smash": {
+        "label": "Rock Smash",
+        "desc": "Smash rocks for encounters (Geodude, etc.).",
+        "status": "Ready",
+    },
+    "level_evolution": {
+        "label": "Level Evolution",
+        "desc": "Level a Pokémon to its evolution threshold.",
+        "status": "Ready",
+    },
+    "stone_evolution": {
+        "label": "Stone Evolution",
+        "desc": "Apply evolution stones from bag.",
+        "status": "Ready",
+    },
+    "trade_evolution": {
+        "label": "Trade Evolution",
+        "desc": "Coordinate trade evolutions between instances.",
+        "status": "Planned",
+    },
+}
+
+
+# ── Emulator worker ─────────────────────────────────────────────────────────
+
+@dataclass
+class InstanceState:
+    instance_id: int = 0
+    status: str = "idle"
+    seed: int = 0
+    tid: int = 0
+    sid: int = 0
+    encounters: int = 0
+    frame_count: int = 0
+    fps: float = 0.0
+    speed_multiplier: int = 0
+    bot_mode: str = "encounter_farm"
+    last_screenshot: Optional[Image.Image] = None
+    shiny_pokemon: str = ""
+    error: str = ""
+    cpu_core: int = -1
+    _stop_event: threading.Event = field(default_factory=threading.Event)
+    _pause_event: threading.Event = field(default_factory=threading.Event)
+
+    def request_stop(self):
+        self._stop_event.set()
+
+    def request_pause(self):
+        if self._pause_event.is_set():
+            self._pause_event.clear()
+        else:
+            self._pause_event.set()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set()
+
+    @property
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+
+# Global stats tracker shared across all workers
+_global_stats = StatsTracker()
+_notifier = NotificationManager()
+
+
+def get_global_stats() -> StatsTracker:
+    return _global_stats
+
+
+def emulator_worker(
+    state: InstanceState,
+    rom_path: str,
+    area: str,
+    speed: int,
+    cpu_count: int,
+):
+    """Background thread running one emulator instance.
+
+    Uses the unified BotMode.step() loop to dispatch all 11 bot modes.
+    Integrates stats tracking, async DB writes, and full Pokémon decryption.
+    """
+    set_thread_affinity(state.instance_id, cpu_count)
+    state.cpu_core = (state.instance_id + 1) % cpu_count
+
+    try:
+        from modules.game_bot import GameBot, GBAButton
+        state.status = "running"
+        state.speed_multiplier = speed
+
+        bot = GameBot()
+        bot.launch(
+            seed=state.seed,
+            tid=state.tid,
+            sid=state.sid,
+            rom_path=Path(rom_path),
+        )
+
+        # Boot the game
+        for _ in range(300):
+            if state.should_stop:
+                bot.destroy()
+                state.status = "stopped"
+                return
+            bot.advance_frames(1)
+            state.frame_count = bot.frame_count
+
+        # Navigate to area for encounter-based modes
+        if state.bot_mode in ("encounter_farm", "sweet_scent", "rock_smash",
+                              "safari_zone", "fishing"):
+            try:
+                bot.navigate_to_area(area)
+            except Exception as exc:
+                logger.warning("Navigation failed (continuing): %s", exc)
+
+        # Instantiate the correct BotMode
+        mode = _create_mode(state.bot_mode, bot)
+        mode.start()
+
+        # Async worker for non-blocking DB writes
+        async_worker = get_async_worker()
+
+        # FPS tracking
+        fps_timer = time.time()
+        fps_frame_start = bot.frame_count
+
+        # Main loop: call mode.step() repeatedly
+        while not state.should_stop:
+            # Handle pause
+            while state.is_paused and not state.should_stop:
+                state.status = "paused"
+                time.sleep(0.1)
+            if state.should_stop:
+                break
+            state.status = "running"
+
+            # Execute one mode step
+            t_start = perf_monitor.time_start("mode_step")
+            result = mode.step()
+            perf_monitor.time_end("mode_step", t_start)
+
+            # Update state from result
+            state.frame_count = bot.frame_count
+            state.encounters = mode.encounters
+
+            # FPS calculation
+            now = time.time()
+            if now - fps_timer >= 1.0:
+                state.fps = (bot.frame_count - fps_frame_start) / (now - fps_timer)
+                fps_timer = now
+                fps_frame_start = bot.frame_count
+
+            # Record encounter in stats tracker (async)
+            if result.encounter is not None:
+                species_id = getattr(result.encounter, "species_id", 0) or 0
+                pv = getattr(result.encounter, "personality_value", 0) or 0
+                async_worker.submit(
+                    _global_stats.record_encounter,
+                    species_id=species_id,
+                    is_shiny=result.is_shiny,
+                    area=area,
+                    instance_id=str(state.instance_id),
+                    bot_mode=state.bot_mode,
+                    personality_value=pv,
+                )
+                perf_monitor.increment("encounters")
+
+            # Handle shiny
+            if result.is_shiny:
+                _handle_shiny(state, bot, result.encounter, async_worker)
+                break
+
+            # Handle mode completion (evolution modes, etc.)
+            if result.status == ModeStatus.COMPLETED:
+                state.status = "completed"
+                logger.info("Mode %s completed: %s", state.bot_mode, result.message)
+                break
+
+            if result.status == ModeStatus.ERROR:
+                state.status = "error"
+                state.error = result.message
+                logger.error("Mode %s error: %s", state.bot_mode, result.message)
+                break
+
+        mode.stop()
+        bot.destroy()
+        if state.status not in ("shiny_found", "completed", "error"):
+            state.status = "stopped"
+
+    except Exception as e:
+        state.status = "error"
+        state.error = str(e)
+        logger.exception("Worker error in instance %d", state.instance_id)
+
+
+def _create_mode(mode_key: str, bot) -> BotMode:
+    """Instantiate the correct BotMode subclass from a mode key string."""
+    mode_cls = ALL_MODES.get(mode_key)
+    if mode_cls is None:
+        logger.warning("Unknown mode '%s', falling back to encounter_farm", mode_key)
+        mode_cls = ALL_MODES["encounter_farm"]
+    return mode_cls(bot)
+
+
+def _handle_shiny(state, bot, encounter, async_worker=None):
+    """Handle a shiny encounter: catch, save, log, screenshot."""
+    state.status = "shiny_found"
+    pv = getattr(encounter, "personality_value", 0) or 0
+    species_id = getattr(encounter, "species_id", 0) or 0
+    state.shiny_pokemon = f"#{species_id} PV=0x{pv:08X}"
+
+    bot.catch_pokemon()
+    bot.save_game()
+
+    try:
+        state.last_screenshot = bot.get_screenshot()
+    except Exception:
+        pass
+
+    # Log to database (async if worker available, sync otherwise)
+    log_fn = lambda: log_shiny(
+        species_id=species_id,
+        personality_value=pv,
+        tid=state.tid, sid=state.sid, seed=state.seed,
+        encounter_count=state.encounters,
+        instance_id=str(state.instance_id),
+    )
+    if async_worker:
+        async_worker.submit(log_fn)
+    else:
+        try:
+            log_fn()
+        except Exception:
+            pass
+
+    # Mark in living dex (async)
+    if species_id > 0:
+        mark_fn = lambda sid=species_id: mark_pokemon_owned(sid, method="shiny_hunt")
+        if async_worker:
+            async_worker.submit(mark_fn)
+        else:
+            try:
+                mark_fn()
+            except Exception:
+                pass
+
+    # Fire notifications (sound + toast + discord) in background threads
+    _notifier.notify_shiny(
+        species_id=species_id,
+        personality_value=pv,
+        encounters=state.encounters,
+        instance_id=str(state.instance_id),
+    )
+
+    logger.info("SHINY FOUND! Instance %d: species #%d PV=0x%08X after %d encounters",
+                state.instance_id, species_id, pv, state.encounters)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GUI APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.settings = load_settings()
+        self.hw = detect_cpu_details()
+        self.instances: Dict[int, InstanceState] = {}
+        self.threads: Dict[int, threading.Thread] = {}
+        self._next_id = 1
+        self._photo_cache: Dict[int, ImageTk.PhotoImage] = {}
+        self._start_time: Optional[float] = None
+        self.cheat_mgr = CheatManager()
+
+        self.title("Gen 3 Shiny Hunter – Living Dex Edition")
+        self.geometry(self.settings.get("window_geometry", "1440x900"))
+        self.minsize(1024, 640)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        init_db()
+        self._build_ui()
+        self._refresh_gui()
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  UI
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # ── Title bar ────────────────────────────────────────────────────
+        title_bar = ctk.CTkFrame(self, fg_color=C["bg_card"], corner_radius=0, height=56)
+        title_bar.pack(fill="x")
+        title_bar.pack_propagate(False)
+
+        ctk.CTkLabel(
+            title_bar, text="GEN 3 SHINY HUNTER",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color=C["accent"],
+        ).pack(side="left", padx=20)
+
+        # CPU badge
+        cpu_text = f"{self.hw['vendor']} {self.hw['arch_name']}"
+        if self.hw["gen_label"]:
+            cpu_text += f" ({self.hw['gen_label']})"
+        cpu_text += f"  {self.hw['cpu_physical']}C/{self.hw['cpu_logical']}T @ {self.hw['freq_ghz']}GHz"
+        cpu_text += f"  |  {self.hw['ram_gb']}GB RAM"
+
+        tier_colors = {"Excellent": C["green"], "Good": C["yellow"], "Moderate": C["red"]}
+        tier_color = tier_colors.get(self.hw["perf_tier"], C["text_dim"])
+
+        hw_frame = ctk.CTkFrame(title_bar, fg_color="transparent")
+        hw_frame.pack(side="right", padx=20)
+        ctk.CTkLabel(
+            hw_frame, text=cpu_text,
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(
+            hw_frame, text=f"[{self.hw['perf_tier']}]",
+            font=ctk.CTkFont(size=11, weight="bold"), text_color=tier_color,
+        ).pack(side="left")
+
+        # ── Main content ─────────────────────────────────────────────────
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=12, pady=12)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+
+        # Left sidebar (scrollable)
+        sidebar = ctk.CTkScrollableFrame(
+            main, width=320, fg_color=C["bg_card"], corner_radius=12,
+            scrollbar_button_color=C["border"],
+            scrollbar_button_hover_color=C["accent"],
+        )
+        sidebar.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        self._build_sidebar(sidebar)
+
+        # Right content area
+        content = ctk.CTkFrame(main, fg_color=C["bg_card"], corner_radius=12)
+        content.grid(row=0, column=1, sticky="nsew")
+        self._build_content(content)
+
+    def _build_sidebar(self, parent):
+        pad = {"padx": 16, "pady": (0, 4)}
+
+        # ── ROM ──────────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="ROM", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+
+        rom_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        rom_frame.pack(fill="x", **pad)
+
+        self._rom_var = ctk.StringVar(value=self.settings.get("rom_path", ""))
+        rom_entry = ctk.CTkEntry(
+            rom_frame, textvariable=self._rom_var,
+            placeholder_text="Select ROM file...",
+            fg_color=C["bg_input"], border_color=C["border"],
+            width=220,
+        )
+        rom_entry.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            rom_frame, text="...", width=36,
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            command=self._browse_rom,
+        ).pack(side="right", padx=(6, 0))
+
+        self._rom_status = ctk.CTkLabel(
+            parent, text="", font=ctk.CTkFont(size=11),
+            text_color=C["text_dim"],
+        )
+        self._rom_status.pack(anchor="w", **pad)
+        self._validate_rom_display()
+
+        # ── Game Version ────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="GAME VERSION", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+
+        self._game_version_var = ctk.StringVar(
+            value=self.settings.get("game_version", "firered"))
+        ctk.CTkOptionMenu(
+            parent, variable=self._game_version_var,
+            values=["firered", "leafgreen", "emerald", "ruby", "sapphire"],
+            fg_color=C["bg_input"], button_color=C["accent"],
+            button_hover_color=C["accent_h"],
+            dropdown_fg_color=C["bg_card"],
+            width=200,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
+        # ── Bot Mode ─────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="BOT MODE", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+
+        self._mode_var = ctk.StringVar(value=self.settings.get("bot_mode", "encounter_farm"))
+        for key, info in BOT_MODES.items():
+            color = C["text"] if info["status"] == "Ready" else C["text_dim"]
+            state = "normal" if info["status"] == "Ready" else "disabled"
+            rb = ctk.CTkRadioButton(
+                parent, text=f"{info['label']}",
+                variable=self._mode_var, value=key,
+                font=ctk.CTkFont(size=12), text_color=color,
+                fg_color=C["accent"], hover_color=C["accent_h"],
+                border_color=C["border"],
+            )
+            rb.pack(anchor="w", padx=20, pady=2)
+            if info["status"] != "Ready":
+                rb.configure(state="disabled")
+
+        # ── Area ─────────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="TARGET AREA", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+
+        self._area_var = ctk.StringVar(value=self.settings.get("target_area", "route1"))
+        ctk.CTkOptionMenu(
+            parent, variable=self._area_var,
+            values=list(ENCOUNTER_AREAS.keys()),
+            fg_color=C["bg_input"], button_color=C["accent"],
+            button_hover_color=C["accent_h"],
+            dropdown_fg_color=C["bg_card"],
+            width=200,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
+        # ── Speed ────────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="SPEED", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+
+        speed_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        speed_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._speed_var = ctk.IntVar(value=self.settings.get("speed_multiplier", 0))
+        for label, val in [("1x", 1), ("2x", 2), ("4x", 4), ("Max", 0)]:
+            ctk.CTkRadioButton(
+                speed_frame, text=label, variable=self._speed_var, value=val,
+                font=ctk.CTkFont(size=12), text_color=C["text"],
+                fg_color=C["accent"], hover_color=C["accent_h"],
+                border_color=C["border"], width=60,
+            ).pack(side="left", padx=(0, 8))
+
+        # ── Instances ────────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="INSTANCES", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+
+        inst_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        inst_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._inst_var = ctk.IntVar(value=self.settings.get("max_instances", 1))
+        self._inst_slider = ctk.CTkSlider(
+            inst_frame, from_=1, to=max(1, self.hw["suggested_max"]),
+            number_of_steps=max(1, self.hw["suggested_max"] - 1),
+            variable=self._inst_var,
+            fg_color=C["border"], progress_color=C["accent"],
+            button_color=C["accent"], button_hover_color=C["accent_h"],
+            command=lambda v: self._inst_label.configure(text=f"{int(v)} / {self.hw['suggested_max']} max"),
+        )
+        self._inst_slider.pack(side="left", fill="x", expand=True)
+        self._inst_label = ctk.CTkLabel(
+            inst_frame,
+            text=f"{self._inst_var.get()} / {self.hw['suggested_max']} max",
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"], width=80,
+        )
+        self._inst_label.pack(side="right", padx=(8, 0))
+
+        # ── Video toggle ─────────────────────────────────────────────────
+        self._video_var = ctk.BooleanVar(value=self.settings.get("video_enabled", False))
+        ctk.CTkCheckBox(
+            parent, text="Screen preview (reduces speed)",
+            variable=self._video_var,
+            font=ctk.CTkFont(size=12), text_color=C["text_dim"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+        ).pack(anchor="w", padx=16, pady=(8, 4))
+
+        # ── Action buttons ───────────────────────────────────────────────
+        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=16, pady=(16, 8))
+
+        self._start_btn = ctk.CTkButton(
+            btn_frame, text="START HUNTING",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=C["green"], hover_color="#16a34a",
+            text_color="#000000", height=42,
+            command=self._start_all,
+        )
+        self._start_btn.pack(fill="x", pady=(0, 6))
+
+        sub_btns = ctk.CTkFrame(btn_frame, fg_color="transparent")
+        sub_btns.pack(fill="x")
+
+        self._stop_btn = ctk.CTkButton(
+            sub_btns, text="Stop All",
+            fg_color=C["red"], hover_color="#dc2626",
+            text_color="#ffffff", height=32, width=120,
+            command=self._stop_all, state="disabled",
+        )
+        self._stop_btn.pack(side="left", expand=True, fill="x", padx=(0, 3))
+
+        self._pause_btn = ctk.CTkButton(
+            sub_btns, text="Pause All",
+            fg_color=C["yellow"], hover_color="#ca8a04",
+            text_color="#000000", height=32, width=120,
+            command=self._pause_all, state="disabled",
+        )
+        self._pause_btn.pack(side="right", expand=True, fill="x", padx=(3, 0))
+
+        # ── Stats ────────────────────────────────────────────────────────
+        stats_frame = ctk.CTkFrame(parent, fg_color=C["bg_input"], corner_radius=8)
+        stats_frame.pack(fill="x", padx=16, pady=(8, 16))
+
+        self._stat_enc = ctk.CTkLabel(stats_frame, text="Encounters: 0", font=ctk.CTkFont(size=12), text_color=C["text"])
+        self._stat_enc.pack(anchor="w", padx=12, pady=(8, 0))
+        self._stat_shiny = ctk.CTkLabel(stats_frame, text="Shinies: 0", font=ctk.CTkFont(size=12, weight="bold"), text_color=C["gold"])
+        self._stat_shiny.pack(anchor="w", padx=12)
+        self._stat_enc_rate = ctk.CTkLabel(stats_frame, text="Enc/hr: 0", font=ctk.CTkFont(size=12), text_color=C["text"])
+        self._stat_enc_rate.pack(anchor="w", padx=12)
+        self._stat_probability = ctk.CTkLabel(stats_frame, text="Shiny chance: 0%", font=ctk.CTkFont(size=12), text_color=C["accent"])
+        self._stat_probability.pack(anchor="w", padx=12)
+        self._stat_fps = ctk.CTkLabel(stats_frame, text="FPS: 0", font=ctk.CTkFont(size=12), text_color=C["text_dim"])
+        self._stat_fps.pack(anchor="w", padx=12)
+        self._stat_time = ctk.CTkLabel(stats_frame, text="Uptime: 0:00:00", font=ctk.CTkFont(size=12), text_color=C["text_dim"])
+        self._stat_time.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # ── Living Dex Progress ───────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="LIVING DEX", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(12, 4))
+
+        dex_frame = ctk.CTkFrame(parent, fg_color=C["bg_input"], corner_radius=8)
+        dex_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._dex_progress_label = ctk.CTkLabel(
+            dex_frame, text="0 / 386 (0%)",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color=C["gold"],
+        )
+        self._dex_progress_label.pack(anchor="w", padx=12, pady=(8, 2))
+
+        self._dex_bar = ctk.CTkProgressBar(
+            dex_frame, height=10,
+            fg_color=C["border"], progress_color=C["gold"],
+        )
+        self._dex_bar.pack(fill="x", padx=12, pady=(0, 4))
+        self._dex_bar.set(0)
+
+        self._dex_detail = ctk.CTkLabel(
+            dex_frame, text="Base: 0  |  Evolved: 0  |  Final: 0",
+            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
+        )
+        self._dex_detail.pack(anchor="w", padx=12, pady=(0, 4))
+
+        self._legit_label = ctk.CTkLabel(
+            dex_frame, text="Legitimacy: CLEAN",
+            font=ctk.CTkFont(size=10, weight="bold"), text_color=C["green"],
+        )
+        self._legit_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # ── Cheat Presets ─────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="CHEAT PRESETS", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(8, 4))
+
+        cheat_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        cheat_frame.pack(fill="x", padx=16, pady=(0, 8))
+
+        presets = [
+            ("Hunting", self._apply_hunting_cheats, C["accent"]),
+            ("Breeding", self._apply_breeding_cheats, C["accent"]),
+            ("Evolution", self._apply_evolution_cheats, C["accent"]),
+            ("Fishing", self._apply_fishing_cheats, C["accent"]),
+        ]
+        for i, (label, cmd, color) in enumerate(presets):
+            ctk.CTkButton(
+                cheat_frame, text=label, width=70, height=26,
+                font=ctk.CTkFont(size=11),
+                fg_color=color, hover_color=C["accent_h"],
+                command=cmd,
+            ).grid(row=i // 2, column=i % 2, padx=2, pady=2, sticky="ew")
+        cheat_frame.grid_columnconfigure(0, weight=1)
+        cheat_frame.grid_columnconfigure(1, weight=1)
+
+        self._cheat_status = ctk.CTkLabel(
+            parent, text="No cheats active",
+            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
+        )
+        self._cheat_status.pack(anchor="w", padx=16, pady=(0, 8))
+
+        # ── Data Export ─────────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="DATA EXPORT", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(8, 4))
+
+        export_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        export_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        ctk.CTkButton(
+            export_frame, text="Export CSV", width=90, height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color=C["bg_input"], hover_color=C["accent"],
+            border_width=1, border_color=C["border"],
+            command=self._export_csv,
+        ).pack(side="left", padx=(0, 4))
+
+        ctk.CTkButton(
+            export_frame, text="Export JSON", width=90, height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color=C["bg_input"], hover_color=C["accent"],
+            border_width=1, border_color=C["border"],
+            command=self._export_json,
+        ).pack(side="left")
+
+        self._export_status = ctk.CTkLabel(
+            parent, text="",
+            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
+        )
+        self._export_status.pack(anchor="w", padx=16, pady=(0, 4))
+
+        # ── Notifications ──────────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="NOTIFICATIONS", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(8, 4))
+
+        notif_frame = ctk.CTkFrame(parent, fg_color=C["bg_input"], corner_radius=8)
+        notif_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._notif_sound_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            notif_frame, text="Sound alert",
+            variable=self._notif_sound_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_notif_settings,
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+
+        self._notif_toast_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            notif_frame, text="Desktop notification",
+            variable=self._notif_toast_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_notif_settings,
+        ).pack(anchor="w", padx=12, pady=2)
+
+        self._notif_discord_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            notif_frame, text="Discord webhook",
+            variable=self._notif_discord_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_notif_settings,
+        ).pack(anchor="w", padx=12, pady=2)
+
+        self._discord_url_var = ctk.StringVar(
+            value=self.settings.get("discord_webhook_url", ""))
+        self._discord_entry = ctk.CTkEntry(
+            notif_frame, textvariable=self._discord_url_var,
+            placeholder_text="Discord webhook URL",
+            fg_color=C["bg_dark"], border_color=C["border"],
+            font=ctk.CTkFont(size=10), height=26, width=240,
+        )
+        self._discord_entry.pack(anchor="w", padx=12, pady=(0, 4))
+
+        test_frame = ctk.CTkFrame(notif_frame, fg_color="transparent")
+        test_frame.pack(anchor="w", padx=12, pady=(0, 8))
+        ctk.CTkButton(
+            test_frame, text="Test Sound", width=75, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color=C["bg_dark"], hover_color=C["accent"],
+            border_width=1, border_color=C["border"],
+            command=lambda: _notifier.test_sound(),
+        ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            test_frame, text="Test Toast", width=75, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color=C["bg_dark"], hover_color=C["accent"],
+            border_width=1, border_color=C["border"],
+            command=lambda: _notifier.test_toast(),
+        ).pack(side="left")
+
+        # ── Recent Encounters ───────────────────────────────────────────
+        ctk.CTkLabel(
+            parent, text="RECENT ENCOUNTERS", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"],
+        ).pack(anchor="w", padx=16, pady=(8, 4))
+
+        self._encounter_log_text = ctk.CTkTextbox(
+            parent, height=120, fg_color=C["bg_input"],
+            font=ctk.CTkFont(size=10, family="Consolas"),
+            text_color=C["text_dim"], corner_radius=8,
+            border_width=1, border_color=C["border"],
+        )
+        self._encounter_log_text.pack(fill="x", padx=16, pady=(0, 16))
+        self._encounter_log_text.configure(state="disabled")
+
+    def _export_csv(self):
+        try:
+            from modules.stats_dashboard import export_csv
+            path = export_csv(_global_stats)
+            self._export_status.configure(
+                text=f"Saved: {path.name}", text_color=C["green"])
+        except Exception as exc:
+            self._export_status.configure(
+                text=f"Error: {exc}", text_color=C["red"])
+
+    def _export_json(self):
+        try:
+            from modules.stats_dashboard import export_json
+            path = export_json(_global_stats)
+            self._export_status.configure(
+                text=f"Saved: {path.name}", text_color=C["green"])
+        except Exception as exc:
+            self._export_status.configure(
+                text=f"Error: {exc}", text_color=C["red"])
+
+    def _update_notif_settings(self):
+        _notifier.sound_enabled = self._notif_sound_var.get()
+        _notifier.toast_enabled = self._notif_toast_var.get()
+        _notifier.discord_enabled = self._notif_discord_var.get()
+        _notifier.discord_webhook_url = self._discord_url_var.get().strip()
+        self.settings["discord_webhook_url"] = _notifier.discord_webhook_url
+        save_settings(self.settings)
+
+    def _apply_hunting_cheats(self):
+        n = self.cheat_mgr.apply_hunting_preset()
+        self._cheat_status.configure(
+            text=f"Hunting preset: {n} cheats enabled",
+            text_color=C["green"])
+        self._log_cheats("hunting")
+
+    def _apply_breeding_cheats(self):
+        n = self.cheat_mgr.apply_breeding_preset()
+        self._cheat_status.configure(
+            text=f"Breeding preset: {n} cheats enabled",
+            text_color=C["green"])
+        self._log_cheats("breeding")
+
+    def _apply_evolution_cheats(self):
+        n = self.cheat_mgr.apply_evolution_preset()
+        self._cheat_status.configure(
+            text=f"Evolution preset: {n} cheats enabled",
+            text_color=C["green"])
+        self._log_cheats("evolution")
+
+    def _apply_fishing_cheats(self):
+        n = self.cheat_mgr.apply_fishing_preset()
+        self._cheat_status.configure(
+            text=f"Fishing preset: {n} cheats enabled",
+            text_color=C["green"])
+        self._log_cheats("fishing")
+
+    def _log_cheats(self, preset: str):
+        for cid in self.cheat_mgr.get_enabled_cheats():
+            cheat = self.cheat_mgr.cheats[cid]
+            try:
+                db_log_cheat(cheat.name, cid, cheat.category.value,
+                             affects_legitimacy=cheat.affects_legitimacy)
+            except Exception:
+                pass
+
+    def _build_content(self, parent):
+        # Header
+        header = ctk.CTkFrame(parent, fg_color="transparent", height=40)
+        header.pack(fill="x", padx=16, pady=(12, 0))
+        header.pack_propagate(False)
+
+        ctk.CTkLabel(
+            header, text="EMULATOR INSTANCES",
+            font=ctk.CTkFont(size=14, weight="bold"), text_color=C["text"],
+        ).pack(side="left")
+
+        self._active_label = ctk.CTkLabel(
+            header, text="0 active",
+            font=ctk.CTkFont(size=12), text_color=C["text_dim"],
+        )
+        self._active_label.pack(side="right")
+
+        # Scrollable instance area
+        self._scroll_frame = ctk.CTkScrollableFrame(
+            parent, fg_color="transparent",
+            scrollbar_button_color=C["border"],
+            scrollbar_button_hover_color=C["accent"],
+        )
+        self._scroll_frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        self._instance_widgets: Dict[int, dict] = {}
+
+        # Placeholder
+        self._placeholder = ctk.CTkLabel(
+            self._scroll_frame,
+            text="No instances running\n\nSelect a ROM and click START HUNTING to begin",
+            font=ctk.CTkFont(size=14), text_color=C["text_dim"],
+            justify="center",
+        )
+        self._placeholder.pack(pady=80)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  INSTANCE CARDS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _create_card(self, inst_id: int, state: InstanceState):
+        card = ctk.CTkFrame(
+            self._scroll_frame, fg_color=C["bg_input"],
+            corner_radius=10, border_width=1, border_color=C["border"],
+        )
+        card.pack(fill="x", pady=4)
+
+        # Row 1: status + info + buttons
+        row1 = ctk.CTkFrame(card, fg_color="transparent")
+        row1.pack(fill="x", padx=12, pady=(10, 4))
+
+        status_label = ctk.CTkLabel(
+            row1, text="STARTING", width=90,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=C["yellow"],
+        )
+        status_label.pack(side="left")
+
+        info_text = f"#{inst_id}  |  Seed: 0x{state.seed:04X}  |  TID: {state.tid}  SID: {state.sid}"
+        if state.cpu_core >= 0:
+            info_text += f"  |  Core {state.cpu_core}"
+        info_label = ctk.CTkLabel(
+            row1, text=info_text,
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+        )
+        info_label.pack(side="left", padx=12)
+
+        mode_label = ctk.CTkLabel(
+            row1, text=BOT_MODES.get(state.bot_mode, {}).get("label", ""),
+            font=ctk.CTkFont(size=10), text_color=C["accent"],
+        )
+        mode_label.pack(side="left", padx=(0, 12))
+
+        btn_box = ctk.CTkFrame(row1, fg_color="transparent")
+        btn_box.pack(side="right")
+
+        pause_btn = ctk.CTkButton(
+            btn_box, text="Pause", width=60, height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color=C["yellow"], hover_color="#ca8a04", text_color="#000",
+            command=lambda: state.request_pause(),
+        )
+        pause_btn.pack(side="left", padx=2)
+
+        stop_btn = ctk.CTkButton(
+            btn_box, text="Stop", width=60, height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color=C["red"], hover_color="#dc2626", text_color="#fff",
+            command=lambda: state.request_stop(),
+        )
+        stop_btn.pack(side="left", padx=2)
+
+        # Row 2: metrics
+        row2 = ctk.CTkFrame(card, fg_color="transparent")
+        row2.pack(fill="x", padx=12, pady=(0, 10))
+
+        enc_label = ctk.CTkLabel(row2, text="Enc: 0", font=ctk.CTkFont(size=12), text_color=C["text"], width=120)
+        enc_label.pack(side="left")
+        fps_label = ctk.CTkLabel(row2, text="FPS: 0", font=ctk.CTkFont(size=12), text_color=C["text"], width=120)
+        fps_label.pack(side="left")
+        frame_label = ctk.CTkLabel(row2, text="Frames: 0", font=ctk.CTkFont(size=12), text_color=C["text_dim"], width=140)
+        frame_label.pack(side="left")
+
+        # Progress bar (visual flair)
+        progress = ctk.CTkProgressBar(
+            row2, width=100, height=8,
+            fg_color=C["border"], progress_color=C["accent"],
+        )
+        progress.pack(side="right", padx=(12, 0))
+        progress.set(0)
+
+        # Preview
+        preview_label = ctk.CTkLabel(card, text="")
+        preview_label.pack(pady=(0, 8))
+
+        self._instance_widgets[inst_id] = {
+            "card": card,
+            "status": status_label,
+            "info": info_label,
+            "enc": enc_label,
+            "fps": fps_label,
+            "frames": frame_label,
+            "progress": progress,
+            "pause": pause_btn,
+            "stop": stop_btn,
+            "preview": preview_label,
+        }
+
+    def _update_card(self, inst_id: int, state: InstanceState):
+        w = self._instance_widgets.get(inst_id)
+        if not w:
+            return
+
+        # Status
+        status_map = {
+            "running": ("RUNNING", C["green"]),
+            "paused": ("PAUSED", C["yellow"]),
+            "shiny_found": ("SHINY!", C["gold"]),
+            "stopped": ("STOPPED", C["red"]),
+            "idle": ("IDLE", C["text_dim"]),
+        }
+        text, color = status_map.get(state.status, ("...", C["text_dim"]))
+        w["status"].configure(text=text, text_color=color)
+
+        if state.status == "shiny_found":
+            w["card"].configure(border_color=C["gold"], border_width=2)
+
+        # Metrics
+        w["enc"].configure(text=f"Enc: {state.encounters:,}")
+        w["fps"].configure(text=f"FPS: {state.fps:,.0f}")
+        w["frames"].configure(text=f"Frames: {state.frame_count:,}")
+
+        # Core info update
+        if state.cpu_core >= 0:
+            info_text = f"#{inst_id}  |  Seed: 0x{state.seed:04X}  |  TID: {state.tid}  SID: {state.sid}  |  Core {state.cpu_core}"
+            w["info"].configure(text=info_text)
+
+        # Animated progress (cycles for visual feedback)
+        if state.status == "running":
+            p = (state.frame_count % 1000) / 1000
+            w["progress"].set(p)
+        elif state.status == "shiny_found":
+            w["progress"].set(1.0)
+            w["progress"].configure(progress_color=C["gold"])
+
+        # Buttons
+        w["pause"].configure(text="Resume" if state.is_paused else "Pause")
+        if state.status in ("stopped", "shiny_found"):
+            w["pause"].configure(state="disabled")
+            w["stop"].configure(state="disabled")
+
+        # Preview
+        if self._video_var.get() and state.last_screenshot is not None:
+            try:
+                img = state.last_screenshot.resize((240, 160), Image.NEAREST)
+                photo = ImageTk.PhotoImage(img)
+                self._photo_cache[inst_id] = photo
+                w["preview"].configure(image=photo)
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  ACTIONS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _browse_rom(self):
+        path = ctk.filedialog.askopenfilename(
+            title="Select GBA ROM",
+            filetypes=[("GBA ROMs", "*.gba *.bin"), ("All files", "*.*")],
+        )
+        if path:
+            self._rom_var.set(path)
+            self.settings["rom_path"] = path
+            save_settings(self.settings)
+            self._validate_rom_display()
+
+    def _validate_rom_display(self):
+        rom = self._rom_var.get()
+        if not rom:
+            self._rom_status.configure(text="No ROM selected", text_color=C["text_dim"])
+            return False
+        p = Path(rom)
+        if not p.exists():
+            self._rom_status.configure(text="File not found!", text_color=C["red"])
+            return False
+        size_mb = p.stat().st_size / (1024 * 1024)
+        self._rom_status.configure(text=f"{p.name} ({size_mb:.1f} MB)", text_color=C["green"])
+        return True
+
+    def _start_all(self):
+        if not self._validate_rom_display():
+            ctk.CTkInputDialog  # just to verify import
+            from tkinter import messagebox
+            messagebox.showerror("Error", "Select a valid GBA ROM file first.")
+            return
+
+        rom_path = self._rom_var.get()
+        area = self._area_var.get()
+        speed = self._speed_var.get()
+        count = int(self._inst_var.get())
+        mode = self._mode_var.get()
+
+        game_version = self._game_version_var.get()
+        self.settings.update({
+            "rom_path": rom_path, "target_area": area,
+            "speed_multiplier": speed, "max_instances": count,
+            "video_enabled": self._video_var.get(), "bot_mode": mode,
+            "game_version": game_version,
+        })
+        save_settings(self.settings)
+
+        self._placeholder.pack_forget()
+        self._start_time = time.time()
+
+        for i in range(count):
+            seed = (0x1234 + i * 0x111) & 0xFFFF
+            tid, sid = seed_to_ids(seed)
+
+            state = InstanceState(
+                instance_id=self._next_id,
+                seed=seed, tid=tid, sid=sid,
+                speed_multiplier=speed, bot_mode=mode,
+            )
+            iid = self._next_id
+            self._next_id += 1
+
+            self.instances[iid] = state
+            self._create_card(iid, state)
+
+            t = threading.Thread(
+                target=emulator_worker,
+                args=(state, rom_path, area, speed, self.hw["cpu_physical"]),
+                daemon=True,
+            )
+            self.threads[iid] = t
+            t.start()
+
+        self._start_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        self._pause_btn.configure(state="normal")
+
+    def _stop_all(self):
+        for s in self.instances.values():
+            s.request_stop()
+        self._stop_btn.configure(state="disabled")
+        self._pause_btn.configure(state="disabled")
+        self.after(2000, self._check_cleanup)
+
+    def _pause_all(self):
+        for s in self.instances.values():
+            if s.status in ("running", "paused"):
+                s.request_pause()
+
+    def _check_cleanup(self):
+        if all(not t.is_alive() for t in self.threads.values()):
+            self._start_btn.configure(state="normal")
+        else:
+            self.after(1000, self._check_cleanup)
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  REFRESH
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _refresh_gui(self):
+        total_enc = 0
+        total_fps = 0.0
+        active = 0
+
+        for iid, state in list(self.instances.items()):
+            self._update_card(iid, state)
+            total_enc += state.encounters
+            if state.status == "running":
+                total_fps += state.fps
+                active += 1
+
+        self._stat_enc.configure(text=f"Encounters: {total_enc:,}")
+        try:
+            self._stat_shiny.configure(text=f"Shinies: {total_shinies()}")
+        except Exception:
+            pass
+        self._stat_fps.configure(text=f"Total FPS: {total_fps:,.0f}  ({active} active)")
+        self._active_label.configure(text=f"{active} active")
+
+        if self._start_time:
+            e = int(time.time() - self._start_time)
+            self._stat_time.configure(text=f"Uptime: {e // 3600}:{(e % 3600) // 60:02d}:{e % 60:02d}")
+
+        # Stats tracker data
+        try:
+            stats = _global_stats.get_summary()
+            enc_hr = stats.get("rolling_rate", 0)
+            if hasattr(self, "_stat_enc_rate"):
+                self._stat_enc_rate.configure(text=f"Enc/hr: {enc_hr:,.0f}")
+            if hasattr(self, "_stat_probability") and total_enc > 0:
+                prob = shiny_probability(total_enc)
+                self._stat_probability.configure(
+                    text=f"Shiny chance: {prob['probability']:.1f}%")
+        except Exception:
+            pass
+
+        # Living Dex progress
+        try:
+            prog = get_living_dex_progress()
+            owned = prog.get("owned", 0)
+            total = prog.get("total", NATIONAL_DEX_SIZE)
+            pct = (owned / total * 100) if total > 0 else 0
+            self._dex_progress_label.configure(text=f"{owned} / {total} ({pct:.1f}%)")
+            self._dex_bar.set(owned / total if total > 0 else 0)
+            by_stage = prog.get("by_stage", {})
+            s1 = by_stage.get(1, {}).get("owned", 0)
+            s2 = by_stage.get(2, {}).get("owned", 0)
+            s3 = by_stage.get(3, {}).get("owned", 0)
+            self._dex_detail.configure(text=f"Base: {s1}  |  Stage 2: {s2}  |  Final: {s3}")
+        except Exception:
+            pass
+
+        # Legitimacy check
+        try:
+            if is_save_legitimate():
+                self._legit_label.configure(text="Legitimacy: CLEAN", text_color=C["green"])
+            else:
+                self._legit_label.configure(text="Legitimacy: MODIFIED", text_color=C["yellow"])
+        except Exception:
+            pass
+
+        # Recent encounters log
+        try:
+            log_entries = _global_stats.session.encounter_log[-10:]
+            if log_entries and hasattr(self, "_encounter_log_text"):
+                lines = []
+                for rec in reversed(log_entries):
+                    shiny_tag = " SHINY!" if rec.is_shiny else ""
+                    lines.append(f"#{rec.species_id:03d} [{rec.bot_mode}]{shiny_tag}")
+                text = "\n".join(lines)
+                self._encounter_log_text.configure(state="normal")
+                self._encounter_log_text.delete("1.0", "end")
+                self._encounter_log_text.insert("1.0", text)
+                self._encounter_log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+        if self.instances:
+            done = all(s.status in ("stopped", "shiny_found", "idle", "completed", "error")
+                       for s in self.instances.values())
+            if done and not any(t.is_alive() for t in self.threads.values()):
+                self._start_btn.configure(state="normal")
+                self._stop_btn.configure(state="disabled")
+                self._pause_btn.configure(state="disabled")
+
+        self.after(200, self._refresh_gui)
+
+    def _on_close(self):
+        self.settings["window_geometry"] = self.geometry()
+        save_settings(self.settings)
+        for s in self.instances.values():
+            s.request_stop()
+        for t in self.threads.values():
+            t.join(timeout=2)
+        try:
+            get_async_worker().stop()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

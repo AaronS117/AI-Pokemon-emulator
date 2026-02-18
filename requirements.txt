@@ -1,0 +1,10 @@
+pyautogui>=0.9.54
+opencv-python>=4.9.0
+numpy>=1.26.4
+Pillow>=10.2.0
+psutil>=5.9.8
+cffi>=1.17.0
+customtkinter>=5.2.0
+matplotlib>=3.8.0
+# libmgba-py 0.2.0 is bundled in mgba/ (downloaded separately from
+# https://github.com/hanzi/libmgba-py/releases — not a pip package)
