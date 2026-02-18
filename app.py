@@ -61,6 +61,16 @@ from modules.stats_dashboard import StatsTracker, shiny_probability
 from modules.performance import get_async_worker, PerformanceMonitor, perf_monitor
 from modules.notifications import NotificationManager
 
+# AI subsystem (optional – private paid module)
+try:
+    from ai.ai_bridge import AIBridge, AIConfig, AIFrameResult
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+    AIBridge = None  # type: ignore[assignment,misc]
+    AIConfig = None   # type: ignore[assignment,misc]
+    AIFrameResult = None  # type: ignore[assignment,misc]
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -336,10 +346,15 @@ class InstanceState:
 # Global stats tracker shared across all workers
 _global_stats = StatsTracker()
 _notifier = NotificationManager()
+_ai_bridge: "AIBridge | None" = None
 
 
 def get_global_stats() -> StatsTracker:
     return _global_stats
+
+
+def get_ai_bridge():
+    return _ai_bridge
 
 
 def emulator_worker(
@@ -424,6 +439,20 @@ def emulator_worker(
                 fps_timer = now
                 fps_frame_start = bot.frame_count
 
+            # AI vision processing (Layer 1 – runs every Nth frame)
+            if _ai_bridge and state.frame_count % 5 == 0:
+                try:
+                    frame = bot.get_screenshot()
+                    if frame is not None:
+                        mem_hint = "battle_wild" if getattr(bot, "in_battle", False) else "overworld"
+                        ai_result = _ai_bridge.process_frame(
+                            frame, memory_state_hint=mem_hint)
+                        if ai_result.is_stuck:
+                            logger.warning("Instance %d: AI detected STUCK state",
+                                           state.instance_id)
+                except Exception:
+                    pass
+
             # Record encounter in stats tracker (async)
             if result.encounter is not None:
                 species_id = getattr(result.encounter, "species_id", 0) or 0
@@ -438,6 +467,27 @@ def emulator_worker(
                     personality_value=pv,
                 )
                 perf_monitor.increment("encounters")
+
+                # AI visual shiny verification (Layer 1 backup check)
+                if _ai_bridge and not result.is_shiny and species_id > 0:
+                    try:
+                        frame = bot.get_screenshot()
+                        if frame is not None:
+                            check = _ai_bridge.verify_shiny(
+                                frame, species_id, memory_says_shiny=False)
+                            if check and check.get("is_shiny") and check.get("confidence", 0) > 0.85:
+                                logger.warning(
+                                    "AI VISUAL OVERRIDE: shiny detected for #%d "
+                                    "(conf=%.2f, method=%s) but memory said no!",
+                                    species_id, check["confidence"], check["method"])
+                                result = ModeResult(
+                                    status=result.status,
+                                    encounter=result.encounter,
+                                    is_shiny=True,
+                                    message="AI visual shiny override",
+                                )
+                    except Exception:
+                        pass
 
             # Handle shiny
             if result.is_shiny:
@@ -968,6 +1018,71 @@ class App(ctk.CTk):
             command=lambda: _notifier.test_toast(),
         ).pack(side="left")
 
+        # ── AI / Training Mode ─────────────────────────────────────────
+        ai_header_text = "AI SYSTEM" if AI_AVAILABLE else "AI SYSTEM (not installed)"
+        ctk.CTkLabel(
+            parent, text=ai_header_text,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C["text"] if AI_AVAILABLE else C["text_dim"],
+        ).pack(anchor="w", padx=16, pady=(8, 4))
+
+        ai_frame = ctk.CTkFrame(parent, fg_color=C["bg_input"], corner_radius=8)
+        ai_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._ai_enabled_var = ctk.BooleanVar(
+            value=self.settings.get("ai", {}).get("enabled", False))
+        ctk.CTkCheckBox(
+            ai_frame, text="Enable AI layers",
+            variable=self._ai_enabled_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_ai_settings,
+            state="normal" if AI_AVAILABLE else "disabled",
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+
+        self._ai_training_var = ctk.BooleanVar(
+            value=self.settings.get("ai", {}).get("training_mode", False))
+        ctk.CTkCheckBox(
+            ai_frame, text="Training mode (collect data)",
+            variable=self._ai_training_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_ai_settings,
+            state="normal" if AI_AVAILABLE else "disabled",
+        ).pack(anchor="w", padx=12, pady=2)
+
+        self._ai_llm_var = ctk.BooleanVar(
+            value=self.settings.get("ai", {}).get("llm_enabled", False))
+        ctk.CTkCheckBox(
+            ai_frame, text="LLM battle advisor",
+            variable=self._ai_llm_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_ai_settings,
+            state="normal" if AI_AVAILABLE else "disabled",
+        ).pack(anchor="w", padx=12, pady=2)
+
+        self._ai_rl_var = ctk.BooleanVar(
+            value=self.settings.get("ai", {}).get("rl_enabled", False))
+        ctk.CTkCheckBox(
+            ai_frame, text="RL navigation agent",
+            variable=self._ai_rl_var,
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+            fg_color=C["accent"], hover_color=C["accent_h"],
+            border_color=C["border"],
+            command=self._update_ai_settings,
+            state="normal" if AI_AVAILABLE else "disabled",
+        ).pack(anchor="w", padx=12, pady=(2, 4))
+
+        self._ai_status = ctk.CTkLabel(
+            ai_frame, text="",
+            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
+        )
+        self._ai_status.pack(anchor="w", padx=12, pady=(0, 8))
+
         # ── Recent Encounters ───────────────────────────────────────────
         ctk.CTkLabel(
             parent, text="RECENT ENCOUNTERS", font=ctk.CTkFont(size=13, weight="bold"),
@@ -1010,6 +1125,39 @@ class App(ctk.CTk):
         _notifier.discord_webhook_url = self._discord_url_var.get().strip()
         self.settings["discord_webhook_url"] = _notifier.discord_webhook_url
         save_settings(self.settings)
+
+    def _update_ai_settings(self):
+        global _ai_bridge
+        ai_settings = {
+            "enabled": self._ai_enabled_var.get(),
+            "training_mode": self._ai_training_var.get(),
+            "vision_enabled": True,
+            "llm_enabled": self._ai_llm_var.get(),
+            "rl_enabled": self._ai_rl_var.get(),
+        }
+        self.settings["ai"] = ai_settings
+        save_settings(self.settings)
+
+        if not AI_AVAILABLE:
+            self._ai_status.configure(text="AI module not installed")
+            return
+
+        if ai_settings["enabled"]:
+            try:
+                config = AIConfig.from_settings(self.settings)
+                _ai_bridge = AIBridge(config)
+                _ai_bridge.initialize()
+                layers = ", ".join(_ai_bridge._initialized_layers) or "none"
+                self._ai_status.configure(
+                    text=f"Active layers: {layers}", text_color=C["green"])
+            except Exception as exc:
+                self._ai_status.configure(
+                    text=f"Error: {exc}", text_color=C["red"])
+        else:
+            if _ai_bridge:
+                _ai_bridge.shutdown()
+                _ai_bridge = None
+            self._ai_status.configure(text="Disabled", text_color=C["text_dim"])
 
     def _apply_hunting_cheats(self):
         n = self.cheat_mgr.apply_hunting_preset()

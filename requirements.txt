@@ -8,3 +8,12 @@ customtkinter>=5.2.0
 matplotlib>=3.8.0
 # libmgba-py 0.2.0 is bundled in mgba/ (downloaded separately from
 # https://github.com/hanzi/libmgba-py/releases — not a pip package)
+
+# ── AI Optional Dependencies (private ai/ module) ──────────────────────────
+# Install these only if using AI features:
+#   pip install torch torchvision stable-baselines3[extra] gymnasium
+#
+# torch>=2.2.0
+# torchvision>=0.17.0
+# stable-baselines3[extra]>=2.3.0
+# gymnasium>=0.29.0
