@@ -2487,16 +2487,40 @@ class App(ctk.CTk):
             messagebox.showerror("Error", "Select a valid GBA ROM file first.")
             return
 
+        rom_path = self._rom_var.get()
+        area = self._area_var.get()
+        speed = self._speed_var.get()
+        count = int(self._inst_var.get())
+        game_version = self._game_version_var.get()
+        _rom_p = Path(rom_path)
+
+        # ── Check save files for all instances-to-be-created ─────────────
+        _any_save = any(
+            save_exists_for_instance(inst_num, _rom_p)
+            for inst_num in range(1, count + 1)
+        )
+
         mode = self._mode_var.get()
         if not mode:
-            from tkinter import messagebox
-            messagebox.showerror("Error", "Select a Bot Mode before starting.")
-            return
+            if _any_save:
+                # Has saves but no mode selected – ask user to pick one
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Bot Mode Required",
+                    "A save file was found.\nPlease select a Bot Mode before starting."
+                )
+                return
+            else:
+                # No saves at all – auto-start in manual mode, no bot mode needed
+                mode = "manual"
+                logger.info(
+                    "No save files found for %d instance(s) – auto-starting in MANUAL mode. "
+                    "Bot will attempt new-game intro sequence, then hand control to you.", count
+                )
 
         # ── Stop and clean up any previous run ───────────────────────────
         for s in self.instances.values():
             s.request_stop()
-        # Destroy old Toplevel windows
         for w_dict in self._instance_widgets.values():
             try:
                 w_dict["win"].destroy()
@@ -2507,19 +2531,12 @@ class App(ctk.CTk):
         self.threads.clear()
         self._next_id = 1  # always start from instance 1
         self._photo_cache.clear()
-        # Destroy old scroll-frame rows
         for r in getattr(self, "_inst_rows", {}).values():
             try:
                 r["frame"].destroy()
             except Exception:
                 pass
         self._inst_rows = {}
-
-        rom_path = self._rom_var.get()
-        area = self._area_var.get()
-        speed = self._speed_var.get()
-        count = int(self._inst_var.get())
-        game_version = self._game_version_var.get()
 
         self.settings.update({
             "rom_path": rom_path, "target_area": area,
@@ -2529,21 +2546,31 @@ class App(ctk.CTk):
         })
         save_settings(self.settings)
 
-        # Show placeholder text in scroll frame describing what's running
-        self._placeholder.configure(
-            text=f"{count} instance window(s) opening…\n\nEach instance runs in its own window.\nUse the Control button in each window to take manual control."
-        )
+        if not _any_save:
+            self._placeholder.configure(
+                text=f"{count} instance(s) starting in MANUAL mode (no save file found).\n\n"
+                     "Bot will try to navigate the new-game intro automatically.\n"
+                     "If it gets stuck, use the Control button to take over.\n\n"
+                     f"Save path expected:  emulator/saves/<1-{count}>/{_rom_p.stem}.sav"
+            )
+        else:
+            self._placeholder.configure(
+                text=f"{count} instance window(s) opening…\n\n"
+                     "Each instance runs in its own window.\n"
+                     "Use the Control button in each window to take manual control."
+            )
         self._placeholder.pack(pady=40)
         self._start_time = time.time()
 
         for i in range(count):
             seed = (0x1234 + i * 0x111) & 0xFFFF
             trainer_id = seed_to_ids(seed)
+            inst_mode = mode
 
             state = InstanceState(
                 instance_id=self._next_id,
                 seed=seed, tid=trainer_id.tid, sid=trainer_id.sid,
-                speed_multiplier=speed, bot_mode=mode,
+                speed_multiplier=speed, bot_mode=inst_mode,
             )
             iid = self._next_id
             self._next_id += 1
