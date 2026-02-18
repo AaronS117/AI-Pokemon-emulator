@@ -381,8 +381,8 @@ def emulator_worker(
     state.cpu_core = (state.instance_id + 1) % cpu_count
 
     try:
-        from modules.game_bot import GameBot, GBAButton
-        state.status = "running"
+        from modules.game_bot import GameBot, GBAButton, GameState as GState
+        state.status = "booting"
         state.speed_multiplier = speed
 
         bot = GameBot()
@@ -393,28 +393,39 @@ def emulator_worker(
             rom_path=Path(rom_path),
         )
 
-        # ── Boot sequence: skip title screen and reach overworld ────────
-        from modules.game_bot import GameState as GState, GBAButton
-        state.status = "booting"
-        MAX_BOOT_FRAMES = 3600  # 60 seconds at 60fps
-        boot_frames = 0
-        while boot_frames < MAX_BOOT_FRAMES:
+        # ── Boot: advance frames until game reaches a playable state ──────
+        # NOTE: pokebot-gen3 requires a save file that is already past the
+        # new-game intro (player named, starter chosen, in overworld).
+        # An empty .sav will boot to the intro cutscene which the bot
+        # cannot navigate automatically.  We advance up to 600 frames
+        # (~10s) pressing A to skip any title/intro screens, then hand
+        # off to the mode regardless so the user can take manual control.
+        BOOT_PRESS_INTERVAL = 30   # press A every 30 frames
+        MAX_BOOT_FRAMES = 600      # ~10 seconds at 60fps
+        for bf in range(MAX_BOOT_FRAMES):
             if state.should_stop:
                 bot.destroy()
                 state.status = "stopped"
                 return
-            game_state = bot.get_game_state()
-            if game_state == GState.TITLE_SCREEN:
-                # Press A/Start to advance past title
+            if bf % BOOT_PRESS_INTERVAL == 0:
                 bot.press_button(GBAButton.A)
-                bot.advance_frames(10)
-            elif game_state in (GState.OVERWORLD, GState.BATTLE,
-                                GState.CHOOSE_STARTER, GState.MAIN_MENU):
-                break  # reached playable state
             else:
-                bot.advance_frames(5)
-            boot_frames += 5
+                bot.advance_frames(1)
             state.frame_count = bot.frame_count
+            # Capture a screenshot periodically so the window shows something
+            if bf % 60 == 0:
+                try:
+                    sc = bot.get_screenshot()
+                    if sc:
+                        state.last_screenshot = sc
+                except Exception:
+                    pass
+            # If we reach a clearly playable state early, stop waiting
+            if bf > 60:
+                gs = bot.get_game_state()
+                if gs in (GState.OVERWORLD, GState.BATTLE,
+                          GState.CHOOSE_STARTER, GState.MAIN_MENU):
+                    break
         state.status = "running"
 
         # Navigate to area for encounter-based modes
@@ -1335,24 +1346,102 @@ class App(ctk.CTk):
 
         self._instance_widgets: Dict[int, dict] = {}
 
-        # Placeholder
+        # Save-file requirement notice
+        notice = ctk.CTkFrame(
+            self._scroll_frame, fg_color="#1a2a1a",
+            corner_radius=8, border_width=1, border_color="#2d5a2d",
+        )
+        notice.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(
+            notice,
+            text="⚠️  IMPORTANT: Each instance needs a save file already past the new-game intro.",
+            font=ctk.CTkFont(size=11, weight="bold"), text_color="#7aba7a",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkLabel(
+            notice,
+            text="Place your .sav file in emulator/saves/<instance_id>/ before starting.\n"
+                 "The bot cannot play through the intro — it needs an existing save in the overworld.",
+            font=ctk.CTkFont(size=10), text_color=C["text_dim"],
+            anchor="w", justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 6))
+
+        # Placeholder / instance status list
         self._placeholder = ctk.CTkLabel(
             self._scroll_frame,
-            text="No instances running\n\nSelect a ROM and click START HUNTING to begin",
-            font=ctk.CTkFont(size=14), text_color=C["text_dim"],
+            text="No instances running\n\nSelect a ROM and Bot Mode, then click START HUNTING.",
+            font=ctk.CTkFont(size=13), text_color=C["text_dim"],
             justify="center",
         )
-        self._placeholder.pack(pady=80)
+        self._placeholder.pack(pady=40)
+
+        # Live instance rows (populated by _refresh_gui)
+        self._inst_rows: Dict[int, ctk.CTkFrame] = {}
 
     # ─────────────────────────────────────────────────────────────────────
     #  INSTANCE CARDS
     # ─────────────────────────────────────────────────────────────────────
 
+    def _create_inst_row(self, inst_id: int, state: InstanceState):
+        """Create a compact status row in the scroll frame for this instance."""
+        row_frame = ctk.CTkFrame(
+            self._scroll_frame, fg_color=C["bg_input"],
+            corner_radius=6, border_width=1, border_color=C["border"],
+        )
+        row_frame.pack(fill="x", pady=3)
+
+        status_lbl = ctk.CTkLabel(
+            row_frame, text="BOOTING", width=72,
+            font=ctk.CTkFont(size=11, weight="bold"), text_color=C["yellow"],
+        )
+        status_lbl.pack(side="left", padx=(8, 0), pady=5)
+
+        info_lbl = ctk.CTkLabel(
+            row_frame,
+            text=f"Instance #{inst_id}  |  TID:{state.tid}  SID:{state.sid}  |  {BOT_MODES.get(state.bot_mode, {}).get('label', state.bot_mode)}",
+            font=ctk.CTkFont(size=11), text_color=C["text_dim"],
+        )
+        info_lbl.pack(side="left", padx=8)
+
+        metrics_lbl = ctk.CTkLabel(
+            row_frame, text="Enc: 0  |  FPS: 0",
+            font=ctk.CTkFont(size=11), text_color=C["text"],
+        )
+        metrics_lbl.pack(side="right", padx=8)
+
+        focus_btn = ctk.CTkButton(
+            row_frame, text="Focus Window", width=90, height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color=C["bg_dark"], hover_color=C["accent"],
+            border_width=1, border_color=C["border"],
+            command=lambda: self._focus_instance_window(inst_id),
+        )
+        focus_btn.pack(side="right", padx=(0, 8))
+
+        self._inst_rows[inst_id] = {
+            "frame": row_frame,
+            "status": status_lbl,
+            "metrics": metrics_lbl,
+        }
+
+    def _focus_instance_window(self, inst_id: int):
+        """Bring the Toplevel window for this instance to the front."""
+        w = self._instance_widgets.get(inst_id)
+        if w:
+            try:
+                win = w["win"]
+                win.deiconify()
+                win.lift()
+                win.focus_set()
+            except Exception:
+                pass
+
     def _create_card(self, inst_id: int, state: InstanceState):
         """Open a dedicated Toplevel window for this emulator instance."""
-        # Tile windows: 4 per row, each 320px wide
-        col = inst_id % 4
-        row = inst_id // 4
+        self._create_inst_row(inst_id, state)
+        # Tile windows: 4 per row, each 320px wide (instances always start at 1)
+        col = (inst_id - 1) % 4
+        row = (inst_id - 1) // 4
         x_off = 20 + col * 340
         y_off = 60 + row * 340
 
@@ -1912,18 +2001,44 @@ class App(ctk.CTk):
 
     def _start_all(self):
         if not self._validate_rom_display():
-            ctk.CTkInputDialog  # just to verify import
             from tkinter import messagebox
             messagebox.showerror("Error", "Select a valid GBA ROM file first.")
             return
+
+        mode = self._mode_var.get()
+        if not mode:
+            from tkinter import messagebox
+            messagebox.showerror("Error", "Select a Bot Mode before starting.")
+            return
+
+        # ── Stop and clean up any previous run ───────────────────────────
+        for s in self.instances.values():
+            s.request_stop()
+        # Destroy old Toplevel windows
+        for w_dict in self._instance_widgets.values():
+            try:
+                w_dict["win"].destroy()
+            except Exception:
+                pass
+        self._instance_widgets.clear()
+        self.instances.clear()
+        self.threads.clear()
+        self._next_id = 1  # always start from instance 1
+        self._photo_cache.clear()
+        # Destroy old scroll-frame rows
+        for r in getattr(self, "_inst_rows", {}).values():
+            try:
+                r["frame"].destroy()
+            except Exception:
+                pass
+        self._inst_rows = {}
 
         rom_path = self._rom_var.get()
         area = self._area_var.get()
         speed = self._speed_var.get()
         count = int(self._inst_var.get())
-        mode = self._mode_var.get()
-
         game_version = self._game_version_var.get()
+
         self.settings.update({
             "rom_path": rom_path, "target_area": area,
             "speed_multiplier": speed, "max_instances": count,
@@ -1932,7 +2047,11 @@ class App(ctk.CTk):
         })
         save_settings(self.settings)
 
-        self._placeholder.pack_forget()
+        # Show placeholder text in scroll frame describing what's running
+        self._placeholder.configure(
+            text=f"{count} instance window(s) opening…\n\nEach instance runs in its own window.\nUse the Control button in each window to take manual control."
+        )
+        self._placeholder.pack(pady=40)
         self._start_time = time.time()
 
         for i in range(count):
@@ -1989,12 +2108,35 @@ class App(ctk.CTk):
         total_fps = 0.0
         active = 0
 
+        status_colors = {
+            "running": C["green"], "booting": C["yellow"], "paused": C["yellow"],
+            "manual": C["accent"], "shiny_found": C["gold"], "stopped": C["red"],
+            "error": C["red"], "idle": C["text_dim"], "completed": C["green"],
+        }
+        status_labels = {
+            "running": "RUNNING", "booting": "BOOTING", "paused": "PAUSED",
+            "manual": "MANUAL", "shiny_found": "SHINY!", "stopped": "STOPPED",
+            "error": "ERROR", "idle": "IDLE", "completed": "DONE",
+        }
         for iid, state in list(self.instances.items()):
             self._update_card(iid, state)
             total_enc += state.encounters
-            if state.status == "running":
+            if state.status in ("running", "manual"):
                 total_fps += state.fps
                 active += 1
+            # Update scroll-frame row
+            row = self._inst_rows.get(iid)
+            if row:
+                txt = status_labels.get(state.status, state.status.upper())
+                col = status_colors.get(state.status, C["text_dim"])
+                row["status"].configure(text=txt, text_color=col)
+                if state.status == "error" and state.error:
+                    row["metrics"].configure(
+                        text=state.error[:50], text_color=C["red"])
+                else:
+                    row["metrics"].configure(
+                        text=f"Enc: {state.encounters:,}  |  FPS: {state.fps:,.0f}",
+                        text_color=C["text"])
 
         self._stat_enc.configure(text=f"Encounters: {total_enc:,}")
         try:
