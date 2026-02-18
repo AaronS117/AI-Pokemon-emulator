@@ -479,7 +479,10 @@ class GameBot:
         """
         try:
             cb = self.get_game_state_symbol()
-            logger.debug("get_game_state: callback2=%s", cb)
+            # Only log when the state symbol changes (avoids flooding at 80fps)
+            if not hasattr(self, "_last_cb2") or self._last_cb2 != cb:
+                logger.debug("get_game_state: callback2=%s", cb)
+                self._last_cb2 = cb
 
             match cb:
                 case "CB2_OVERWORLD":

@@ -637,26 +637,35 @@ def emulator_worker(
                 wlog.info("Instance %d  Manual mode active. Use the Control button in the instance window.", iid)
                 wlog.info("Instance %d  Default keys: A=a  B=s  Start=Enter  Select=Backspace  D-pad=Arrows", iid)
         else:
-            # Existing save: advance frames pressing A to skip title
-            wlog.info("Instance %d  Booting from save – advancing past title screen…", iid)
-            for bf in range(600):
-                if state.should_stop:
-                    bot.destroy()
-                    state.status = "stopped"
-                    return
-                if bf % 30 == 0:
-                    bot.press_button(GBAButton.A)
-                else:
-                    bot.advance_frames(1)
-                state.frame_count = bot.frame_count
-                if bf % 60 == 0:
-                    _worker_capture_screen(bot, state)
-                if bf > 60:
+            # Existing save: check state immediately, only advance if still on title
+            wlog.info("Instance %d  Booting from save – checking initial game state…", iid)
+            _initial_gs = bot.get_game_state()
+            wlog.info("Instance %d  Initial game state: %s", iid, _initial_gs.name)
+            _worker_capture_screen(bot, state)
+
+            if _initial_gs not in (GState.OVERWORLD, GState.BATTLE,
+                                   GState.CHOOSE_STARTER, GState.MAIN_MENU,
+                                   GState.CHANGE_MAP):
+                wlog.info("Instance %d  Not yet in playable state – advancing past title screen…", iid)
+                for bf in range(600):
+                    if state.should_stop:
+                        bot.destroy()
+                        state.status = "stopped"
+                        return
+                    if bf % 30 == 0:
+                        bot.press_button(GBAButton.A)
+                    else:
+                        bot.advance_frames(1)
+                    state.frame_count = bot.frame_count
+                    if bf % 60 == 0:
+                        _worker_capture_screen(bot, state)
                     gs = bot.get_game_state()
                     if gs in (GState.OVERWORLD, GState.BATTLE,
                               GState.CHOOSE_STARTER, GState.MAIN_MENU):
-                        wlog.info("Instance %d  Reached game state: %s", iid, gs.name)
+                        wlog.info("Instance %d  Reached game state: %s after %d frames", iid, gs.name, bf)
                         break
+            else:
+                wlog.info("Instance %d  Already in playable state (%s) – skipping title advance", iid, _initial_gs.name)
 
         state.status = "running"
         wlog.info("Instance %d  Boot complete – entering main loop (mode=%s)", iid, state.bot_mode)
