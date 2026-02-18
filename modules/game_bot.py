@@ -17,14 +17,29 @@ Handles:
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import struct
 import sys
+import time as _time_mod
 import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# ── Windows high-resolution timer (1 ms precision for time.sleep) ────────────
+# On Windows, the default timer resolution is ~15 ms, which makes sleep-based
+# frame throttling wildly inaccurate at 59.7 fps (16.74 ms/frame).
+# timeBeginPeriod(1) sets the system timer to 1 ms resolution globally.
+# Reference: BizHawk uses the same technique in its throttle loop.
+_winmm = None
+try:
+    _winmm = ctypes.WinDLL("winmm")
+    _winmm.timeBeginPeriod(1)
+    logging.getLogger(__name__).debug("Windows timer resolution set to 1 ms (timeBeginPeriod)")
+except (OSError, AttributeError):
+    pass  # Non-Windows or winmm unavailable – sleep precision unchanged
 
 from modules.config import (
     EMULATOR_DIR,
@@ -265,6 +280,16 @@ class GameBot:
         bot.destroy()
     """
 
+    # GBA hardware constants (from ARM7TDMI / GBA hardware reference)
+    # Clock:        16,777,216 Hz
+    # H-blank:      308 cycles/line  × 228 lines/frame = 70,224 cycles/frame
+    # Wait:         68 cycles/line   × 228 lines/frame (h-blank portion)
+    # Total/frame:  280,896 cycles  (16,777,216 / 280,896 = 59.7275560... fps)
+    GBA_CLOCK_HZ: int   = 16_777_216
+    GBA_CYCLES_PER_FRAME: int = 280_896
+    GBA_FPS: float      = GBA_CLOCK_HZ / GBA_CYCLES_PER_FRAME  # 59.7275560...
+    GBA_FRAME_MS: float = 1000.0 / GBA_FPS                     # 16.7427... ms
+
     def __init__(self) -> None:
         self.instance: Optional[EmulatorInstance] = None
         self._pressed_inputs: int = 0
@@ -276,6 +301,11 @@ class GameBot:
         self._video_enabled: bool = True   # always capture frames for preview
         self._render_every: int = 4        # capture 1 frame every N frames (15fps preview)
         self._frames_since_render: int = 0
+        # Real-time FPS tracking (updated every second)
+        self._fps_wall_t0: float = 0.0
+        self._fps_frame0: int = 0
+        self.real_fps: float = 0.0         # measured fps, readable from outside
+        self._sleep_overrun_ms: float = 0.0  # last sleep overrun in ms (debug)
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -395,16 +425,16 @@ class GameBot:
         import time as _time
         self._speed = speed
         # _frame_budget: seconds per frame budget (0 = no sleep)
-        # GBA native frame rate: 16,777,216 Hz / 280,896 cycles per frame
-        # = 59.7275560...  fps  (NOT 60.0)
-        _GBA_FPS = 16_777_216 / 280_896  # ≈ 59.7275
         if speed > 0:
-            self._frame_budget = 1.0 / (_GBA_FPS * speed)
+            self._frame_budget = 1.0 / (self.GBA_FPS * speed)
         else:
             self._frame_budget = 0.0
         # Initialise the timer NOW so the very first frame doesn't see
         # elapsed = (now - 0.0) = huge and skip the sleep entirely.
-        self._last_frame_time = _time.perf_counter()
+        self._last_frame_time = _time_mod.perf_counter()
+        self._fps_wall_t0 = _time_mod.perf_counter()
+        self._fps_frame0 = self.frame_count
+        self.real_fps = 0.0
 
     def destroy(self) -> None:
         """Shut down the current emulator instance."""
@@ -609,7 +639,6 @@ class GameBot:
         we just throttle how often we READ it for the UI preview.
         Applies sleep-based throttle when _frame_budget > 0 (speed=1x etc.).
         """
-        import time as _time
         core = self.instance._core
 
         # Run one GBA frame (mGBA always renders internally)
@@ -630,12 +659,27 @@ class GameBot:
 
         # Sleep-based throttle to hit the target frame rate
         if self._frame_budget > 0:
-            now = _time.perf_counter()
+            now = _time_mod.perf_counter()
             elapsed = now - self._last_frame_time
             remaining = self._frame_budget - elapsed
             if remaining > 0:
-                _time.sleep(remaining)
-            self._last_frame_time = _time.perf_counter()
+                _time_mod.sleep(remaining)
+                # Measure overrun (how much longer we slept than requested)
+                actual = _time_mod.perf_counter() - now
+                self._sleep_overrun_ms = (actual - remaining) * 1000.0
+            else:
+                self._sleep_overrun_ms = 0.0
+            self._last_frame_time = _time_mod.perf_counter()
+
+        # Update real_fps every ~60 frames
+        fc = self.frame_count
+        if fc - self._fps_frame0 >= 60:
+            now = _time_mod.perf_counter()
+            elapsed = now - self._fps_wall_t0
+            if elapsed > 0:
+                self.real_fps = (fc - self._fps_frame0) / elapsed
+            self._fps_wall_t0 = now
+            self._fps_frame0 = fc
 
     def press_button(self, button: GBAButton, hold_frames: int = INPUT_HOLD_FRAMES) -> None:
         """Press and hold a GBA button for the specified number of frames."""

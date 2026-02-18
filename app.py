@@ -607,6 +607,22 @@ def emulator_worker(
     set_thread_affinity(iid, cpu_count)
     state.cpu_core = (iid + 1) % cpu_count
 
+    # ── Frame-stamped logger ──────────────────────────────────────────────
+    # Every call to _flog() prepends [F:NNNNN fps:XX.X] so every log line
+    # shows exactly which frame it fired on and what the measured fps is.
+    _bot_ref: list = [None]  # filled after bot.launch()
+    def _flog(level: str, msg: str, *args) -> None:
+        b = _bot_ref[0]
+        if b is not None:
+            fc  = b.frame_count
+            fps = b.real_fps
+            ovr = b._sleep_overrun_ms
+            prefix = f"[F:{fc:06d} fps:{fps:5.1f} ovr:{ovr:4.1f}ms] "
+        else:
+            prefix = "[F:------ fps:---.-] "
+        full = prefix + msg
+        getattr(wlog, level)(full, *args)
+
     wlog.info("=" * 60)
     wlog.info("Instance %d starting  |  ROM: %s", iid, rom_path)
     wlog.info("Instance %d  seed=0x%04X  TID=%d  SID=%d  mode=%s",
@@ -650,8 +666,13 @@ def emulator_worker(
         # Store the actual save path so the UI can display it
         if bot.instance and bot.instance.save_path:
             state.save_path = str(bot.instance.save_path)
-        wlog.info("Instance %d  Emulator launched  save=%s  speed=%s",
-                  iid, state.save_path or "none", f"{speed}x" if speed > 0 else "max")
+        _bot_ref[0] = bot  # now _flog() can read frame/fps
+        _flog("info", "Instance %d  Emulator launched  save=%s  speed=%s  "
+              "frame_budget=%.4fms  GBA_FPS=%.4f",
+              iid, state.save_path or "none",
+              f"{speed}x" if speed > 0 else "max",
+              bot._frame_budget * 1000,
+              bot.GBA_FPS)
 
         # Enable video immediately so the screen preview shows during boot
         bot.set_video_enabled(True)
@@ -674,15 +695,15 @@ def emulator_worker(
                 wlog.info("Instance %d  Default keys: A=a  B=s  Start=Enter  Select=Backspace  D-pad=Arrows", iid)
         else:
             # Existing save: check state immediately, only advance if still on title
-            wlog.info("Instance %d  Booting from save – checking initial game state…", iid)
+            _flog("info", "Instance %d  Booting from save – checking initial game state…", iid)
             _initial_gs = bot.get_game_state()
-            wlog.info("Instance %d  Initial game state: %s", iid, _initial_gs.name)
+            _flog("info", "Instance %d  Initial game state: %s", iid, _initial_gs.name)
             _worker_capture_screen(bot, state)
 
             if _initial_gs not in (GState.OVERWORLD, GState.BATTLE,
                                    GState.CHOOSE_STARTER, GState.MAIN_MENU,
                                    GState.CHANGE_MAP):
-                wlog.info("Instance %d  Not yet in playable state – advancing past title screen…", iid)
+                _flog("info", "Instance %d  Not yet in playable state – advancing past title screen…", iid)
                 for bf in range(600):
                     if state.should_stop:
                         bot.destroy()
@@ -693,32 +714,37 @@ def emulator_worker(
                     else:
                         bot.advance_frames(1)
                     state.frame_count = bot.frame_count
+                    state.fps = bot.real_fps
                     if bf % 60 == 0:
                         _worker_capture_screen(bot, state)
+                        _flog("debug", "Instance %d  boot-advance bf=%d  state=%s",
+                              iid, bf, bot.get_game_state().name)
                     gs = bot.get_game_state()
                     if gs in (GState.OVERWORLD, GState.BATTLE,
                               GState.CHOOSE_STARTER, GState.MAIN_MENU):
-                        wlog.info("Instance %d  Reached game state: %s after %d frames", iid, gs.name, bf)
+                        _flog("info", "Instance %d  Reached game state: %s after %d frames",
+                              iid, gs.name, bf)
                         break
             else:
-                wlog.info("Instance %d  Already in playable state (%s) – skipping title advance", iid, _initial_gs.name)
+                _flog("info", "Instance %d  Already in playable state (%s) – skipping title advance",
+                      iid, _initial_gs.name)
 
-        wlog.info("Instance %d  Boot complete – entering main loop (mode=%s)", iid, state.bot_mode)
+        _flog("info", "Instance %d  Boot complete – entering main loop (mode=%s)", iid, state.bot_mode)
 
         # If started in manual mode, idle but do NOT auto-set manual_control.
         # The user must explicitly click the Manual button in the instance window.
         if state.bot_mode == "manual":
             state.status = "manual"
-            wlog.info("Instance %d  Manual mode – click the Manual button in the instance window to take control", iid)
+            _flog("info", "Instance %d  Manual mode – click the Manual button in the instance window to take control", iid)
 
         # Navigate to area only for encounter-based bot modes
         if not state.manual_control and state.bot_mode in (
                 "encounter_farm", "sweet_scent", "rock_smash", "safari_zone", "fishing"):
-            wlog.info("Instance %d  Navigating to area: %s", iid, area)
+            _flog("info", "Instance %d  Navigating to area: %s", iid, area)
             try:
                 bot.navigate_to_area(area)
             except Exception as exc:
-                wlog.warning("Instance %d  Navigation failed (continuing): %s", iid, exc)
+                _flog("warning", "Instance %d  Navigation failed (continuing): %s", iid, exc)
 
         # Instantiate the current BotMode (may be _ManualMode initially)
         _active_mode_key = state.bot_mode
@@ -754,24 +780,33 @@ def emulator_worker(
                 mode = _create_mode(_active_mode_key, bot)
                 mode.start()
                 bot._render_every = 4   # bot mode: preview ~15fps
-                wlog.info("Instance %d  Switched to mode: %s", iid, _active_mode_key)
+                _flog("info", "Instance %d  Switched to mode: %s", iid, _active_mode_key)
 
             # ── Manual / paused idle loop ────────────────────────────────────
             while (state.is_paused or state.manual_control) and not state.should_stop:
                 if state.manual_control:
                     bot._render_every = 1  # manual: capture every frame for live preview
                     state.status = "manual"
+                    _btn_pressed_this_tick = []
                     while True:
                         try:
                             btn_name = state._input_queue.get_nowait()
                             gbtn = _btn_map.get(btn_name.lower())
                             if gbtn is not None:
+                                _btn_pressed_this_tick.append(btn_name)
                                 bot.press_button(gbtn, hold_frames=4)
                         except _queue.Empty:
                             break
+                    if _btn_pressed_this_tick:
+                        _flog("info",
+                              "Instance %d  [MANUAL] btn=%s  overrun=%.2fms",
+                              iid,
+                              "+".join(_btn_pressed_this_tick),
+                              bot._sleep_overrun_ms)
                     # advance_frames(1) already throttles via _frame_budget
                     bot.advance_frames(1)
                     state.frame_count = bot.frame_count
+                    state.fps = bot.real_fps
                     sc = bot.get_screenshot()
                     if sc:
                         state.last_screenshot = sc
@@ -789,22 +824,17 @@ def emulator_worker(
                 mode = _create_mode(_active_mode_key, bot)
                 mode.start()
                 bot._render_every = 4   # bot mode: preview ~15fps
-                wlog.info("Instance %d  Resumed with mode: %s", iid, _active_mode_key)
+                _flog("info", "Instance %d  Resumed with mode: %s", iid, _active_mode_key)
 
             # ── Watch mode: game runs at 1x, full video, no bot inputs ───────
             if _active_mode_key == "manual":
                 bot._render_every = 1  # watch mode: every frame
                 bot.advance_frames(1)
                 state.frame_count = bot.frame_count
+                state.fps = bot.real_fps
                 sc = bot.get_screenshot()
                 if sc:
                     state.last_screenshot = sc
-                # FPS update (runs every second)
-                now = time.time()
-                if now - fps_timer >= 1.0:
-                    state.fps = (bot.frame_count - fps_frame_start) / (now - fps_timer)
-                    fps_timer = now
-                    fps_frame_start = bot.frame_count
                 # No extra sleep – advance_frames(1) already throttles at 1x
                 continue
 
@@ -819,12 +849,9 @@ def emulator_worker(
             state.frame_count = bot.frame_count
             state.encounters = mode.encounters
 
-            # FPS calculation
-            now = time.time()
-            if now - fps_timer >= 1.0:
-                state.fps = (bot.frame_count - fps_frame_start) / (now - fps_timer)
-                fps_timer = now
-                fps_frame_start = bot.frame_count
+            # FPS – use bot's own measured fps (updated every 60 frames)
+            state.fps = bot.real_fps
+            fps_timer = time.time()  # keep alive for sidebar aggregation
 
             # Live screen capture for GUI preview (every 30 frames ~= 0.5s at 60fps)
             if state.frame_count % 30 == 0:
