@@ -256,13 +256,16 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
     # ── Input-locked overlay (shown until user clicks Manual) ─────────────
     _input_locked = [not _init_manual]  # True = keyboard blocked
 
+    # Semi-transparent glass overlay – fg_color="transparent" lets the game
+    # frame show through; the text floats over it.
     input_overlay = ctk.CTkLabel(
         screen_frame,
-        text="🔒  Click  🕹 Manual  to take control\n\nKeyboard input is disabled",
-        font=ctk.CTkFont(size=12, weight="bold"),
-        text_color=C["text_dim"],
-        fg_color="#0a0a0a",
+        text="🔒 Manual  to take control",
+        font=ctk.CTkFont(size=11, weight="bold"),
+        text_color="#cccccc",
+        fg_color="transparent",
         corner_radius=0,
+        anchor="s",
     )
     if _input_locked[0]:
         input_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)

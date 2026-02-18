@@ -426,7 +426,7 @@ def _worker_capture_screen(bot, state) -> None:
         pass
 
 
-def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RED") -> bool:
+def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RED", fps_state: list = None) -> bool:
     """
     Navigate the Fire Red new-game intro sequence automatically.
 
@@ -437,24 +437,37 @@ def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RE
     iid = state.instance_id
     logger.info("[Instance %d] Fresh save – starting new-game intro sequence", iid)
     logger.info("[Instance %d] Player name: %s", iid, player_name)
+    # fps_state = [timer, frame_start] – mutable so caller sees updates
+    if fps_state is None:
+        fps_state = [time.time(), bot.frame_count]
+    _fps_timer = fps_state[0]
+    _fps_frame_start = fps_state[1]
 
-    # Fire Red naming screen: uppercase A-Z laid out in rows of 9
-    # Row 0: A B C D E F G H I  (indices 0-8)
-    # Row 1: J K L M N O P Q R  (indices 9-17)
-    # Row 2: S T U V W X Y Z    (indices 18-25)
+    def _update_fps():
+        nonlocal _fps_timer, _fps_frame_start
+        _now = time.time()
+        if _now - _fps_timer >= 1.0:
+            state.fps = (bot.frame_count - _fps_frame_start) / (_now - _fps_timer)
+            _fps_timer = _now
+            _fps_frame_start = bot.frame_count
+            fps_state[0] = _fps_timer
+            fps_state[1] = _fps_frame_start
+
+    # Fire Red naming screen keyboard layout (uppercase mode):
+    # 10 columns per row, cursor starts at A (col=0, row=0)
+    #
+    # Row 0: A  B  C  D  E  F  G  H  I  J
+    # Row 1: K  L  M  N  O  P  Q  R  S  T
+    # Row 2: U  V  W  X  Y  Z  (6 chars, then space/special)
+    # Row 3: (special chars / numbers)
+    # Row 4: DEL  OK  (bottom row)
+    #
+    # OK button is at approximately col=9, row=4 from A.
+    CHARS_PER_ROW = 10
     CHAR_MAP = {c: i for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}
-    CHARS_PER_ROW = 9
 
     def _stop():
         return state.should_stop
-
-    def _advance(frames, press=None):
-        """Advance frames, optionally pressing a button, and update state."""
-        if press is not None:
-            bot.press_button(press)
-        else:
-            bot.advance_frames(frames)
-        state.frame_count = bot.frame_count
 
     def _gs():
         return bot.get_game_state()
@@ -464,35 +477,49 @@ def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RE
         logger.info("[Instance %d] %s  game_state=%s  frame=%d", iid, label, gs.name, bot.frame_count)
         return gs
 
-    # ── Phase 1: Title screen → press A until play-time counter starts ───
-    # The title screen runs until the player presses A/Start.
-    # We know we're past it when get_game_state() != TITLE_SCREEN.
-    logger.info("[Instance %d] Phase 1: waiting for title screen to clear…", iid)
-    for f in range(600):   # up to ~10s at 60fps
-        if _stop(): return False
-        bot.press_button(GBAButton.A)
-        bot.advance_frames(10)
+    def _nav_press(btn, count=1):
+        """Press a d-pad button count times with minimal delay (1 hold frame each)."""
+        for _ in range(count):
+            if _stop():
+                return
+            bot.press_button(btn, hold_frames=1)
+            bot.advance_frames(2)   # small gap so game registers each press
         state.frame_count = bot.frame_count
-        if f % 60 == 0:
-            gs = _log_state(f"Phase1 f={f*10}")
-            _worker_capture_screen(bot, state)
-            if gs != GState.TITLE_SCREEN and gs != GState.UNKNOWN:
+
+    # ── Phase 1: Title screen → press A/Start until past title ───────────
+    # GBA Fire Red title screen: press A or Start to proceed.
+    # We spam A every few frames until game_state leaves TITLE_SCREEN.
+    logger.info("[Instance %d] Phase 1: waiting for title screen to clear…", iid)
+    for f in range(1800):   # up to 30s at 60fps
+        if _stop(): return False
+        bot.press_button(GBAButton.A, hold_frames=1)
+        bot.advance_frames(4)
+        state.frame_count = bot.frame_count
+        _update_fps()
+        if f % 30 == 0:
+            gs = _log_state(f"Phase1 f={f}")
+            sc = bot.get_screenshot()
+            if sc:
+                state.last_screenshot = sc
+            if gs not in (GState.TITLE_SCREEN, GState.UNKNOWN):
                 logger.info("[Instance %d] Title screen cleared → %s", iid, gs.name)
                 break
     else:
         logger.warning("[Instance %d] Phase 1 timed out (still on title/unknown)", iid)
 
     # ── Phase 2: Oak's intro speech → keep pressing A until NAMING_SCREEN ─
-    # Oak talks for ~300-500 frames of A-presses before the naming screen.
     logger.info("[Instance %d] Phase 2: skipping Oak's intro speech…", iid)
-    for f in range(800):
+    for f in range(2400):   # up to 40s
         if _stop(): return False
-        bot.press_button(GBAButton.A)
-        bot.advance_frames(8)
+        bot.press_button(GBAButton.A, hold_frames=1)
+        bot.advance_frames(4)
         state.frame_count = bot.frame_count
-        if f % 60 == 0:
-            gs = _log_state(f"Phase2 f={f*8}")
-            _worker_capture_screen(bot, state)
+        _update_fps()
+        if f % 30 == 0:
+            gs = _log_state(f"Phase2 f={f}")
+            sc = bot.get_screenshot()
+            if sc:
+                state.last_screenshot = sc
             if gs == GState.NAMING_SCREEN:
                 logger.info("[Instance %d] Naming screen detected!", iid)
                 break
@@ -503,9 +530,13 @@ def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RE
         logger.warning("[Instance %d] Phase 2 timed out – naming screen not detected, attempting name entry anyway", iid)
 
     # ── Phase 3: Type player name ─────────────────────────────────────────
-    # Give the naming screen a moment to fully render
-    bot.advance_frames(30)
+    # Wait for naming screen to fully render before navigating
+    bot.advance_frames(60)
+    sc = bot.get_screenshot()
+    if sc:
+        state.last_screenshot = sc
     logger.info("[Instance %d] Phase 3: typing name '%s'", iid, player_name)
+
     cur_col, cur_row = 0, 0
     for ch in player_name.upper():
         if _stop(): return False
@@ -516,41 +547,45 @@ def _worker_new_game_intro(bot, state, GBAButton, GState, player_name: str = "RE
         target_row = target_idx // CHARS_PER_ROW
         dc = target_col - cur_col
         dr = target_row - cur_row
-        for _ in range(abs(dr)):
-            bot.press_button(GBAButton.DOWN if dr > 0 else GBAButton.UP)
-            bot.advance_frames(6)
-        for _ in range(abs(dc)):
-            bot.press_button(GBAButton.RIGHT if dc > 0 else GBAButton.LEFT)
-            bot.advance_frames(6)
-        bot.press_button(GBAButton.A)
-        bot.advance_frames(8)
+        # Navigate rows then columns
+        _nav_press(GBAButton.DOWN if dr > 0 else GBAButton.UP, abs(dr))
+        _nav_press(GBAButton.RIGHT if dc > 0 else GBAButton.LEFT, abs(dc))
+        # Press A to select the letter
+        bot.press_button(GBAButton.A, hold_frames=1)
+        bot.advance_frames(6)
         cur_col, cur_row = target_col, target_row
         state.frame_count = bot.frame_count
         logger.debug("[Instance %d] Typed '%s' (col=%d row=%d)", iid, ch, target_col, target_row)
 
-    # Navigate to the OK button (bottom-right of naming screen)
+    # Navigate to the OK button:
+    # OK is on row 4 (4 rows below row 2 last char), rightmost position
+    # From last char position navigate down to OK row then right to OK
     logger.info("[Instance %d] Confirming name…", iid)
-    for _ in range(4):
-        bot.press_button(GBAButton.DOWN)
-        bot.advance_frames(6)
-    for _ in range(8):
-        bot.press_button(GBAButton.RIGHT)
-        bot.advance_frames(6)
-    bot.press_button(GBAButton.A)   # OK
-    bot.advance_frames(60)
-    _worker_capture_screen(bot, state)
+    rows_to_ok = 4 - cur_row   # OK is on row 4
+    _nav_press(GBAButton.DOWN, rows_to_ok)
+    # Navigate right to OK (rightmost column = 9)
+    cols_to_ok = 9 - cur_col
+    _nav_press(GBAButton.RIGHT, cols_to_ok)
+    bot.press_button(GBAButton.A, hold_frames=1)   # OK
+    bot.advance_frames(90)
+    sc = bot.get_screenshot()
+    if sc:
+        state.last_screenshot = sc
     _log_state("After name confirm")
 
     # ── Phase 4: Post-name cutscenes → keep pressing A until OVERWORLD ────
     logger.info("[Instance %d] Phase 4: skipping post-name cutscenes…", iid)
-    for f in range(1200):
+    for f in range(3600):   # up to 60s
         if _stop(): return False
-        bot.press_button(GBAButton.A)
-        bot.advance_frames(8)
+        bot.press_button(GBAButton.A, hold_frames=1)
+        bot.advance_frames(4)
         state.frame_count = bot.frame_count
-        if f % 60 == 0:
-            gs = _log_state(f"Phase4 f={f*8}")
-            _worker_capture_screen(bot, state)
+        _update_fps()
+        if f % 30 == 0:
+            gs = _log_state(f"Phase4 f={f}")
+            sc = bot.get_screenshot()
+            if sc:
+                state.last_screenshot = sc
             if gs in (GState.OVERWORLD, GState.CHOOSE_STARTER):
                 logger.info("[Instance %d] Reached playable state: %s", iid, gs.name)
                 return True
@@ -618,10 +653,19 @@ def emulator_worker(
         wlog.info("Instance %d  Emulator launched  save=%s  speed=%s",
                   iid, state.save_path or "none", f"{speed}x" if speed > 0 else "max")
 
+        # Enable video immediately so the screen preview shows during boot
+        bot.set_video_enabled(True)
+
+        # FPS tracking starts here so it's live during boot too
+        _fps_timer = time.time()
+        _fps_frame_start = bot.frame_count
+        _fps_state = [_fps_timer, _fps_frame_start]  # mutable; updated by intro fn
+
         # ── Boot sequence ─────────────────────────────────────────────────
         if not _has_save:
             # Try to play through the new-game intro automatically
-            _reached_game = _worker_new_game_intro(bot, state, GBAButton, GState)
+            _reached_game = _worker_new_game_intro(
+                bot, state, GBAButton, GState, fps_state=_fps_state)
             if not _reached_game:
                 wlog.warning("Instance %d  Could not complete intro – enabling MANUAL mode", iid)
                 state.manual_control = True
@@ -684,11 +728,11 @@ def emulator_worker(
         # Async worker for non-blocking DB writes
         async_worker = get_async_worker()
 
-        # FPS tracking
-        fps_timer = time.time()
-        fps_frame_start = bot.frame_count
+        # FPS tracking – reuse the timer/frame from boot so FPS is continuous
+        fps_timer = _fps_state[0]
+        fps_frame_start = _fps_state[1]
 
-        # In manual/watch mode render every frame so the preview is live
+        # Video already enabled right after launch; keep it on in main loop
         bot.set_video_enabled(True)
 
         _btn_map = {
