@@ -157,12 +157,28 @@ class StarterResetMode(BotMode):
     """
     Soft-reset loop for shiny starters.
 
-    Inspired by pokebot-gen3's starters.py – waits for the starter to be
-    visible in the party before checking shininess, then soft resets.
+    Ported from pokebot-gen3's starters.py:
+      1. Soft reset → mash A through intro/title/continue
+      2. Wait for overworld
+      3. Walk to the correct pokeball on the table
+      4. Face up and press A to interact
+      5. Mash A until party count > 0 (starter received)
+      6. Read party slot 0 and check shininess
+      7. If not shiny → soft reset and repeat
+
+    FRLG Oak's Lab pokeball coordinates (from pokefirered decompilation):
+      Bulbasaur = (8, 5)   Squirtle = (9, 5)   Charmander = (10, 5)
     """
 
     name = "Starter Reset"
     description = "Soft-reset for shiny starter Pokémon"
+
+    # Pokeball table coordinates in Oak's Lab (FRLG)
+    _STARTER_COORDS = {
+        0: (8, 5),   # Bulbasaur  (left)
+        1: (9, 5),   # Squirtle   (middle)
+        2: (10, 5),  # Charmander (right)
+    }
 
     def __init__(self, bot: GameBot, starter_index: int = 0):
         super().__init__(bot)
@@ -174,6 +190,7 @@ class StarterResetMode(BotMode):
         if self.status != ModeStatus.RUNNING:
             return ModeResult(status=self.status)
 
+        # ── Phase: reset ──────────────────────────────────────────────────
         if self._phase == "reset":
             fc = self.bot.frame_count
             logger.info("[StarterReset] Soft reset #%d at frame %d",
@@ -184,59 +201,114 @@ class StarterResetMode(BotMode):
             return ModeResult(status=ModeStatus.RUNNING,
                               message=f"Soft resetting... (reset #{self.encounters+1}, frame {fc})")
 
+        # ── Phase: skip_intro ─────────────────────────────────────────────
         elif self._phase == "skip_intro":
-            # Mash A to get through intro screens
+            # Mash A to get through intro/title/continue screens
             self.bot.press_button(GBAButton.A)
             self.bot.advance_frames(10)
             self._wait_frames += 1
 
-            # After enough frames, check if we're in the overworld
+            # After enough A-presses, check if we're in the overworld
             if self._wait_frames > 60:
                 state = self.bot.get_game_state()
                 if state == GameState.OVERWORLD:
-                    logger.info("[StarterReset] Overworld reached at frame %d",
-                                self.bot.frame_count)
-                    self._phase = "select_starter"
+                    try:
+                        coords = self.bot.get_player_coords()
+                        facing = self.bot.get_player_facing()
+                        logger.info("[StarterReset] Overworld reached at frame %d  pos=%s facing=%s",
+                                    self.bot.frame_count, coords, facing)
+                    except Exception:
+                        logger.info("[StarterReset] Overworld reached at frame %d",
+                                    self.bot.frame_count)
+                    self._phase = "walk_to_pokeball"
                     self._wait_frames = 0
 
-            return ModeResult(status=ModeStatus.RUNNING,
-                              message="Skipping intro...")
-
-        elif self._phase == "select_starter":
-            # Navigate to starter and press A
-            # In Oak's lab, starters are on the table
-            # Press A to interact, then confirm selection
-            self.bot.press_button(GBAButton.A)
-            self.bot.advance_frames(20)
-            self._wait_frames += 1
-
-            # Check if party count increased (starter received)
-            try:
-                party_count = struct.unpack(
-                    "<I", self.bot.read_bytes(0x02024280, 4))[0]
-                if party_count > 0:
-                    self._phase = "check_shiny"
-            except Exception:
-                pass
-
             if self._wait_frames > 200:
-                logger.warning("[StarterReset] Starter select timed out at frame %d – resetting",
+                logger.warning("[StarterReset] Intro skip timed out at frame %d – resetting",
                                self.bot.frame_count)
                 self._phase = "reset"
 
             return ModeResult(status=ModeStatus.RUNNING,
-                              message="Selecting starter...")
+                              message="Skipping intro...")
 
+        # ── Phase: walk_to_pokeball ───────────────────────────────────────
+        elif self._phase == "walk_to_pokeball":
+            target_x, target_y = self._STARTER_COORDS.get(self.starter_index, (8, 5))
+            logger.info("[StarterReset] Walking to pokeball at (%d, %d)  frame %d",
+                        target_x, target_y, self.bot.frame_count)
+            reached = self.bot.walk_to(target_x, target_y, timeout_frames=300)
+            if reached:
+                try:
+                    coords = self.bot.get_player_coords()
+                    logger.info("[StarterReset] Reached pokeball at %s  frame %d",
+                                coords, self.bot.frame_count)
+                except Exception:
+                    pass
+                self._phase = "face_and_interact"
+                self._wait_frames = 0
+            else:
+                logger.warning("[StarterReset] Walk to pokeball timed out at frame %d – resetting",
+                               self.bot.frame_count)
+                self._phase = "reset"
+            return ModeResult(status=ModeStatus.RUNNING,
+                              message="Walking to pokeball...")
+
+        # ── Phase: face_and_interact ──────────────────────────────────────
+        elif self._phase == "face_and_interact":
+            # Face up toward the table, then press A to interact
+            self.bot.face_direction("up")
+            self.bot.advance_frames(10)
+            self.bot.press_button(GBAButton.A)
+            self.bot.advance_frames(30)
+            logger.info("[StarterReset] Interacted with pokeball at frame %d",
+                        self.bot.frame_count)
+            self._phase = "confirm_starter"
+            self._wait_frames = 0
+            return ModeResult(status=ModeStatus.RUNNING,
+                              message="Interacting with pokeball...")
+
+        # ── Phase: confirm_starter ────────────────────────────────────────
+        elif self._phase == "confirm_starter":
+            # Mash A to confirm "Do you want this Pokémon?" dialog
+            # and decline nickname, until party count > 0
+            self.bot.press_button(GBAButton.A)
+            self.bot.advance_frames(10)
+            self._wait_frames += 1
+
+            party_count = self.bot.get_party_count()
+            if party_count > 0:
+                logger.info("[StarterReset] Starter received! party=%d  frame %d",
+                            party_count, self.bot.frame_count)
+                # Decline nickname with B, then wait for dialog to finish
+                self.bot.press_button(GBAButton.B)
+                self.bot.advance_frames(30)
+                self.bot.press_button(GBAButton.B)
+                self.bot.advance_frames(60)
+                self._phase = "check_shiny"
+                return ModeResult(status=ModeStatus.RUNNING,
+                                  message="Starter received, checking...")
+
+            if self._wait_frames > 300:
+                logger.warning("[StarterReset] Starter confirm timed out at frame %d – resetting",
+                               self.bot.frame_count)
+                self._phase = "reset"
+
+            return ModeResult(status=ModeStatus.RUNNING,
+                              message="Confirming starter selection...")
+
+        # ── Phase: check_shiny ────────────────────────────────────────────
         elif self._phase == "check_shiny":
-            # Read party slot 0
             self.encounters += 1
             try:
-                raw = self.bot.read_bytes(0x02024284, 100)
+                raw = self.bot.read_symbol("gPlayerParty", 0, 100)
                 pv = struct.unpack("<I", raw[0:4])[0]
                 ot = struct.unpack("<I", raw[4:8])[0]
                 tid = ot & 0xFFFF
                 sid = (ot >> 16) & 0xFFFF
                 is_shiny = (tid ^ sid ^ (pv >> 16) ^ (pv & 0xFFFF)) < 8
+
+                logger.info("[StarterReset] Reset #%d  PV=0x%08X  TID=%d  SID=%d  shiny=%s  frame %d",
+                            self.encounters, pv, tid, sid, is_shiny, self.bot.frame_count)
 
                 if is_shiny:
                     self.shinies_found += 1
@@ -248,11 +320,9 @@ class StarterResetMode(BotMode):
                         message=f"SHINY STARTER after {self.encounters} resets!"
                     )
             except Exception as exc:
-                logger.error("Failed to read starter data: %s", exc)
+                logger.error("[StarterReset] Failed to read starter data: %s", exc)
 
             # Not shiny – reset
-            logger.info("[StarterReset] Reset #%d not shiny (frame %d)",
-                        self.encounters, self.bot.frame_count)
             self._phase = "reset"
             return ModeResult(
                 is_shiny=False,

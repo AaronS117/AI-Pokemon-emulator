@@ -288,7 +288,11 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
     # D-pad buttons use hold/release model (continuous movement).
     # Action buttons use tap model (momentary press).
     _HELD_BTNS = {"up", "down", "left", "right"}
-    _currently_held: set = set()  # debounce OS auto-repeat
+    _currently_held: set = set()  # tracks which d-pad keys are physically held
+    _release_timers: dict = {}   # btn -> after-id; debounce phantom KeyRelease
+    # Windows fires KeyRelease→KeyPress pairs rapidly during auto-repeat.
+    # We delay the release by 30ms; if a KeyPress arrives first, we cancel it.
+    _RELEASE_DELAY_MS = 30
 
     def _on_key_press(event):
         if not state.manual_control:
@@ -297,22 +301,43 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
         if not btn:
             return
         if btn in _HELD_BTNS:
-            if btn not in _currently_held:  # ignore OS auto-repeat
+            # Cancel any pending phantom release for this key
+            timer_id = _release_timers.pop(btn, None)
+            if timer_id is not None:
+                try:
+                    win.after_cancel(timer_id)
+                except Exception:
+                    pass
+            if btn not in _currently_held:
                 _currently_held.add(btn)
                 state.send_input(f"key_down:{btn}")
         else:
             state.send_input(btn)  # tap: A/B/Start/Select/L/R
+
+    def _do_release(btn):
+        """Actually release a d-pad key after the debounce delay."""
+        _release_timers.pop(btn, None)
+        if btn in _currently_held:
+            _currently_held.discard(btn)
+            state.send_input(f"key_up:{btn}")
 
     def _on_key_release(event):
         if not state.manual_control:
             return
         btn = _keybinds.get(event.keysym)
         if btn and btn in _HELD_BTNS and btn in _currently_held:
-            _currently_held.discard(btn)
-            state.send_input(f"key_up:{btn}")
+            # Schedule release after a short delay; KeyPress will cancel if auto-repeat
+            if btn not in _release_timers:
+                _release_timers[btn] = win.after(_RELEASE_DELAY_MS, lambda b=btn: _do_release(b))
 
     def _on_focus_out(event):
         """Release all held keys when window loses focus."""
+        for btn, tid in list(_release_timers.items()):
+            try:
+                win.after_cancel(tid)
+            except Exception:
+                pass
+        _release_timers.clear()
         for btn in list(_currently_held):
             state.send_input(f"key_up:{btn}")
         _currently_held.clear()

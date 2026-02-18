@@ -209,6 +209,7 @@ FIREREED_SYMBOLS: Dict[str, Tuple[int, int]] = {
     "GBATTLETYPEFLAGS":    (0x02022B4C, 4),
     "SPLAYTIMECOUNTERSTATE": (0x03000E7C, 1),     # corrected from sym file
     "GOBJECTEVENTS":       (0x02036E38, 0x240),
+    "GPLAYERAVATAR":       (0x02037078, 0x24),
 }
 
 
@@ -628,6 +629,88 @@ class GameBot:
             return int.from_bytes(obj_data, "little") != 0
         except Exception:
             return False
+
+    # ── Player position / navigation helpers (pokefirered struct layouts) ────
+
+    def get_player_coords(self) -> Tuple[int, int]:
+        """
+        Read the player's current (x, y) map-local coordinates.
+        Uses gPlayerAvatar.objectEventId → gObjectEvents[id].currentCoords.
+        ObjectEvent is 0x24 bytes; currentCoords is at offset 0x10 (Coords16).
+        """
+        avatar_addr, _ = self._sym("gPlayerAvatar")
+        obj_event_id = self.read_bytes(avatar_addr + 5, 1)[0]
+        obj_addr, _ = self._sym("gObjectEvents")
+        coords_raw = self.read_bytes(obj_addr + obj_event_id * 0x24 + 0x10, 4)
+        x = struct.unpack_from("<h", coords_raw, 0)[0]
+        y = struct.unpack_from("<h", coords_raw, 2)[0]
+        return (x, y)
+
+    def get_player_facing(self) -> str:
+        """
+        Read the player's facing direction.
+        ObjectEvent offset 0x18 lower nibble: 1=down, 2=up, 3=left, 4=right.
+        """
+        avatar_addr, _ = self._sym("gPlayerAvatar")
+        obj_event_id = self.read_bytes(avatar_addr + 5, 1)[0]
+        obj_addr, _ = self._sym("gObjectEvents")
+        raw = self.read_bytes(obj_addr + obj_event_id * 0x24 + 0x18, 1)[0]
+        facing = raw & 0xF
+        return {1: "down", 2: "up", 3: "left", 4: "right"}.get(facing, "unknown")
+
+    def get_player_map(self) -> Tuple[int, int]:
+        """Read (mapGroup, mapNum) from SaveBlock1 offset 4."""
+        data = self.get_save_block(1, offset=4, size=2)
+        return (data[0], data[1])
+
+    def get_party_count(self) -> int:
+        """Read the current party Pokémon count."""
+        try:
+            addr, _ = self._sym("gPlayerPartyCount")
+            return struct.unpack("<I", self.read_bytes(addr, 4))[0]
+        except Exception:
+            return 0
+
+    def walk_to(self, target_x: int, target_y: int, run: bool = False,
+                timeout_frames: int = 600) -> bool:
+        """
+        Walk the player to (target_x, target_y) on the current map.
+        Holds d-pad buttons until coordinates match, like pokebot-gen3's walk_to().
+        Returns True if reached, False if timed out.
+        """
+        for _ in range(timeout_frames):
+            x, y = self.get_player_coords()
+            if x == target_x and y == target_y:
+                self.release_all()
+                return True
+            self._held_inputs = 0
+            if run:
+                self._held_inputs |= (1 << GBAButton.B)
+            if target_x < x:
+                self._held_inputs |= (1 << GBAButton.LEFT)
+            elif target_x > x:
+                self._held_inputs |= (1 << GBAButton.RIGHT)
+            elif target_y < y:
+                self._held_inputs |= (1 << GBAButton.UP)
+            elif target_y > y:
+                self._held_inputs |= (1 << GBAButton.DOWN)
+            self._apply_inputs_and_run_frame()
+        self.release_all()
+        return False
+
+    def face_direction(self, direction: str, frames: int = 4) -> None:
+        """Turn the player to face a direction without moving."""
+        btn_map = {"up": GBAButton.UP, "down": GBAButton.DOWN,
+                   "left": GBAButton.LEFT, "right": GBAButton.RIGHT}
+        btn = btn_map.get(direction)
+        if btn is None:
+            return
+        # Tap the direction for 1 frame, then wait for the turn to complete
+        self._pressed_inputs = 1 << btn.value
+        self._apply_inputs_and_run_frame()
+        self._pressed_inputs = 0
+        for _ in range(frames - 1):
+            self._apply_inputs_and_run_frame()
 
     def is_in_battle(self) -> bool:
         state = self.get_game_state()
