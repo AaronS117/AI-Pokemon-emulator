@@ -799,10 +799,20 @@ def emulator_worker(
                         except _queue.Empty:
                             break
                     if _btn_pressed_this_tick:
+                        # Compress repeated buttons: a,a,a,a → a×4
+                        _btn_parts = []
+                        _prev_b, _run = _btn_pressed_this_tick[0], 1
+                        for _b in _btn_pressed_this_tick[1:]:
+                            if _b == _prev_b:
+                                _run += 1
+                            else:
+                                _btn_parts.append(_prev_b if _run == 1 else f"{_prev_b}\xd7{_run}")
+                                _prev_b, _run = _b, 1
+                        _btn_parts.append(_prev_b if _run == 1 else f"{_prev_b}\xd7{_run}")
                         _flog("info",
                               "Instance %d  [MANUAL] btn=%s  overrun=%.2fms",
                               iid,
-                              "+".join(_btn_pressed_this_tick),
+                              "+".join(_btn_parts),
                               bot._sleep_overrun_ms)
                     # advance_frames(1) already throttles via _frame_budget
                     bot.advance_frames(1)

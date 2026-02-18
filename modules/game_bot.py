@@ -308,6 +308,9 @@ class GameBot:
         self._sleep_overrun_ms: float = 0.0  # last sleep overrun in ms (debug)
         self.pil_ms: float = 0.0           # last to_pil() duration in ms (debug)
         self.pil_ms_max: float = 0.0       # worst-case to_pil() in ms (debug)
+        # Hybrid throttle: sleep until SPIN_LEAD_S before deadline, then busy-spin.
+        # This eliminates the ~0.4ms sleep overrun that causes 58.4 instead of 59.7 fps.
+        self._SPIN_LEAD_S: float = 0.0005  # busy-spin the last 0.5 ms
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -663,19 +666,21 @@ class GameBot:
         self._prev_pressed_inputs = self._pressed_inputs
         self._pressed_inputs = 0
 
-        # Sleep-based throttle to hit the target frame rate
+        # Hybrid sleep+spin throttle to hit the target frame rate precisely.
+        # Pure sleep() overshoots by ~0.4ms on Windows even with timeBeginPeriod(1).
+        # Solution: sleep until SPIN_LEAD_S before the deadline, then busy-spin.
         if self._frame_budget > 0:
+            deadline = self._last_frame_time + self._frame_budget
             now = _time_mod.perf_counter()
-            elapsed = now - self._last_frame_time
-            remaining = self._frame_budget - elapsed
-            if remaining > 0:
-                _time_mod.sleep(remaining)
-                # Measure overrun (how much longer we slept than requested)
-                actual = _time_mod.perf_counter() - now
-                self._sleep_overrun_ms = (actual - remaining) * 1000.0
-            else:
-                self._sleep_overrun_ms = 0.0
-            self._last_frame_time = _time_mod.perf_counter()
+            sleep_until = deadline - self._SPIN_LEAD_S
+            if now < sleep_until:
+                _time_mod.sleep(sleep_until - now)
+            # Busy-spin the last 0.5 ms for precision
+            while _time_mod.perf_counter() < deadline:
+                pass
+            after = _time_mod.perf_counter()
+            self._sleep_overrun_ms = (after - deadline) * 1000.0
+            self._last_frame_time = after
 
         # Update real_fps every ~60 frames
         fc = self.frame_count
