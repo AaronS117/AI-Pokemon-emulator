@@ -270,6 +270,9 @@ class GameBot:
         self._pressed_inputs: int = 0
         self._held_inputs: int = 0
         self._prev_pressed_inputs: int = 0
+        self._speed: int = 0
+        self._frame_budget: float = 0.0  # seconds per frame; 0 = unthrottled
+        self._last_frame_time: float = 0.0
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -376,26 +379,20 @@ class GameBot:
 
     def set_speed(self, speed: int) -> None:
         """
-        Set emulation speed.
-        speed=0 → unthrottled (max FPS)
-        speed=1 → 1× (60 fps)
-        speed=N → N× (N*60 fps, throttled via audio/sleep)
-        Matches pokebot-gen3 LibmgbaEmulator.set_throttle / set_speed_factor.
+        Set emulation speed for headless (no-audio) mode.
+        speed=0 → unthrottled max
+        speed=1 → ~60 fps via sleep-based throttle
+        speed=N → ~N*60 fps via sleep-based throttle
+
+        libmgba-py's GBA object has no set_sync/set_throttle method –
+        throttling is done by sleeping between run_frame() calls.
         """
-        if self.instance is None or self.instance._core is None:
-            return
-        core = self.instance._core
-        if speed == 0:
-            # Unthrottled – disable audio-based throttle
-            core.set_sync(False)
-        else:
-            core.set_sync(True)
-            # mGBA's set_sync(True) runs at 1×; we can't set a multiplier
-            # without the audio layer, so we just enable/disable throttle.
-            # For >1× speeds we disable throttle (same as Max for headless).
-            if speed > 1:
-                core.set_sync(False)
         self._speed = speed
+        # _frame_budget: seconds per frame budget (0 = no sleep)
+        if speed > 0:
+            self._frame_budget = 1.0 / (60.0 * speed)
+        else:
+            self._frame_budget = 0.0
 
     def destroy(self) -> None:
         """Shut down the current emulator instance."""
@@ -595,12 +592,23 @@ class GameBot:
     # ── Input (matching pokebot-gen3 press/hold/release model) ───────────
 
     def _apply_inputs_and_run_frame(self) -> None:
-        """Set current inputs on the core and advance one frame."""
+        """Set current inputs on the core and advance one frame.
+        Applies sleep-based throttle when _frame_budget > 0 (speed=1x etc.).
+        """
+        import time as _time
         core = self.instance._core
         core._core.setKeys(core._core, self._pressed_inputs | self._held_inputs)
         core.run_frame()
         self._prev_pressed_inputs = self._pressed_inputs
         self._pressed_inputs = 0
+        # Sleep-based throttle (only when 1x or Nx speed is requested)
+        if self._frame_budget > 0:
+            now = _time.perf_counter()
+            elapsed = now - self._last_frame_time
+            remaining = self._frame_budget - elapsed
+            if remaining > 0:
+                _time.sleep(remaining)
+            self._last_frame_time = _time.perf_counter()
 
     def press_button(self, button: GBAButton, hold_frames: int = INPUT_HOLD_FRAMES) -> None:
         """Press and hold a GBA button for the specified number of frames."""

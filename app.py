@@ -1870,6 +1870,12 @@ class App(ctk.CTk):
         if win is None:
             return
 
+        try:
+            self._update_card_inner(inst_id, state, w, win)
+        except Exception:
+            pass  # Toplevel may be destroyed mid-update (TclError) – silently skip
+
+    def _update_card_inner(self, inst_id: int, state: InstanceState, w: dict, win):
         # Status label + window title color
         status_map = {
             "running":    ("RUNNING",  C["green"]),
