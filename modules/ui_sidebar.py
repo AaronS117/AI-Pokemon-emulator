@@ -36,12 +36,18 @@ def make_collapsible_section(parent, title: str, C: dict, expanded: bool = True)
     """
     Create a collapsible sidebar section.
     Returns the inner body frame to pack widgets into.
-    Click the header row to toggle visibility.
+
+    Uses a container frame so that collapsing/expanding never reorders
+    sections — the body always lives directly below its header.
     """
     state = {"open": expanded}
 
-    header = ctk.CTkFrame(parent, fg_color=C["bg_input"], corner_radius=6)
-    header.pack(fill="x", padx=10, pady=(6, 0))
+    # Container holds header + body together; never re-packed
+    container = ctk.CTkFrame(parent, fg_color="transparent")
+    container.pack(fill="x", padx=6, pady=(4, 0))
+
+    header = ctk.CTkFrame(container, fg_color=C["bg_input"], corner_radius=6)
+    header.pack(fill="x")
 
     arrow = ctk.CTkLabel(header, text="▼" if expanded else "▶",
                          font=ctk.CTkFont(size=11), text_color=C["accent"], width=18)
@@ -50,16 +56,17 @@ def make_collapsible_section(parent, title: str, C: dict, expanded: bool = True)
                  font=ctk.CTkFont(size=12, weight="bold"),
                  text_color=C["text"]).pack(side="left", pady=5)
 
-    body = ctk.CTkFrame(parent, fg_color="transparent")
+    # Body lives inside the container, right after the header
+    body = ctk.CTkFrame(container, fg_color="transparent")
     if expanded:
-        body.pack(fill="x", padx=4, pady=(0, 2))
+        body.pack(fill="x", pady=(0, 2))
 
     def _toggle(e=None):
         if state["open"]:
             body.pack_forget()
             arrow.configure(text="▶")
         else:
-            body.pack(fill="x", padx=4, pady=(0, 2))
+            body.pack(fill="x", pady=(0, 2))
             arrow.configure(text="▼")
         state["open"] = not state["open"]
 

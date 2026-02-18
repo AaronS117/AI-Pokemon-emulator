@@ -155,6 +155,19 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
 
     ctrl_btn_ref = [None]
 
+    # Bot mode dropdown – only the "Ready" modes
+    _ready_modes = {k: v["label"] for k, v in BOT_MODES.items() if v["status"] == "Ready" and k != "manual"}
+    _mode_keys   = list(_ready_modes.keys())
+    _mode_labels = list(_ready_modes.values())
+    _init_bot_mode = state.bot_mode if state.bot_mode in _ready_modes else (_mode_keys[0] if _mode_keys else "encounter_farm")
+    _mode_var = ctk.StringVar(value=BOT_MODES.get(_init_bot_mode, {}).get("label", _init_bot_mode))
+
+    def _label_to_key(label: str) -> str:
+        for k, v in BOT_MODES.items():
+            if v["label"] == label:
+                return k
+        return "encounter_farm"
+
     def _set_manual(on: bool):
         state.manual_control = on
         if on:
@@ -165,6 +178,9 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
                               border_color=C["border"])
             win.focus_set()
         else:
+            # Switch to whichever mode is selected in the dropdown
+            chosen = _label_to_key(_mode_var.get())
+            state.bot_mode = chosen
             state.status = "running"
             bot_btn.configure(fg_color=C["accent"], text_color="#fff",
                               border_color=C["accent"])
@@ -182,7 +198,7 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
         border_color=C["accent"] if _init_manual else C["border"],
         command=lambda: _set_manual(True),
     )
-    manual_btn.pack(side="left", fill="x", expand=True, padx=(6, 2), pady=4)
+    manual_btn.pack(side="left", padx=(6, 2), pady=4)
 
     bot_btn = ctk.CTkButton(
         ctrl_row, text="🤖 Bot", height=26,
@@ -193,7 +209,18 @@ def create_card(app: "App", inst_id: int, state: "InstanceState"):
         border_color=C["border"] if _init_manual else C["accent"],
         command=lambda: _set_manual(False),
     )
-    bot_btn.pack(side="left", fill="x", expand=True, padx=(2, 6), pady=4)
+    bot_btn.pack(side="left", padx=(2, 4), pady=4)
+
+    # Mode picker – visible so user can choose which bot mode to resume
+    ctk.CTkOptionMenu(
+        ctrl_row, variable=_mode_var,
+        values=_mode_labels,
+        fg_color=C["bg_dark"], button_color=C["accent"],
+        button_hover_color=C["accent_h"],
+        dropdown_fg_color=C["bg_card"],
+        text_color=C["text"], font=ctk.CTkFont(size=10),
+        height=26, dynamic_resizing=True,
+    ).pack(side="left", fill="x", expand=True, padx=(0, 6), pady=4)
 
     ctrl_btn_ref[0] = manual_btn
     _ctrl_pair = {"manual": manual_btn, "bot": bot_btn}

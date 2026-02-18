@@ -71,6 +71,38 @@ def show_save_dialog(app: "App", count: int, rom_p: Path) -> Optional[dict]:
                  font=ctk.CTkFont(size=11), text_color=C["text_dim"],
                  ).pack(side="right", padx=16)
 
+    # ── Footer buttons (packed BEFORE scroll so it's never clipped) ────────
+    footer = ctk.CTkFrame(dlg, fg_color=C["bg_card"], corner_radius=0)
+    footer.pack(fill="x", side="bottom")
+
+    result: list = [None]
+
+    def _ok():
+        result[0] = {n: v.get() for n, v in choices.items()}
+        dlg.destroy()
+
+    def _cancel():
+        dlg.destroy()
+
+    ctk.CTkButton(footer, text="Cancel", width=100, height=36,
+                  font=ctk.CTkFont(size=13),
+                  fg_color=C["bg_dark"], hover_color=C["red"],
+                  border_width=1, border_color=C["border"],
+                  text_color=C["text"],
+                  command=_cancel,
+                  ).pack(side="right", padx=(6, 14), pady=10)
+
+    ctk.CTkButton(footer, text="▶  Start", width=120, height=36,
+                  font=ctk.CTkFont(size=13, weight="bold"),
+                  fg_color=C["green"], hover_color="#16a34a", text_color="#000",
+                  command=_ok,
+                  ).pack(side="right", padx=(0, 6), pady=10)
+
+    ctk.CTkLabel(footer,
+                 text="Tip: 'New game' will auto-play the intro then pause for you.",
+                 font=ctk.CTkFont(size=10), text_color=C["text_dim"],
+                 ).pack(side="left", padx=14)
+
     # ── Scrollable instance list ──────────────────────────────────────────
     scroll = ctk.CTkScrollableFrame(dlg, fg_color="transparent")
     scroll.pack(fill="both", expand=True, padx=12, pady=(8, 4))
@@ -158,38 +190,6 @@ def show_save_dialog(app: "App", count: int, rom_p: Path) -> Optional[dict]:
             border_width=1, border_color=C["border"],
             command=_browse,
         ).pack(anchor="e", padx=10, pady=(0, 8))
-
-    # ── Footer buttons ────────────────────────────────────────────────────
-    footer = ctk.CTkFrame(dlg, fg_color=C["bg_card"], corner_radius=0)
-    footer.pack(fill="x", side="bottom")
-
-    result: list = [None]
-
-    def _ok():
-        result[0] = {n: v.get() for n, v in choices.items()}
-        dlg.destroy()
-
-    def _cancel():
-        dlg.destroy()
-
-    ctk.CTkButton(footer, text="Cancel", width=100, height=36,
-                  font=ctk.CTkFont(size=13),
-                  fg_color=C["bg_dark"], hover_color=C["red"],
-                  border_width=1, border_color=C["border"],
-                  text_color=C["text"],
-                  command=_cancel,
-                  ).pack(side="right", padx=(6, 14), pady=10)
-
-    ctk.CTkButton(footer, text="▶  Start", width=120, height=36,
-                  font=ctk.CTkFont(size=13, weight="bold"),
-                  fg_color=C["green"], hover_color="#16a34a", text_color="#000",
-                  command=_ok,
-                  ).pack(side="right", padx=(0, 6), pady=10)
-
-    ctk.CTkLabel(footer,
-                 text="Tip: 'New game' will auto-play the intro then pause for you.",
-                 font=ctk.CTkFont(size=10), text_color=C["text_dim"],
-                 ).pack(side="left", padx=14)
 
     app.wait_window(dlg)
     return result[0]
